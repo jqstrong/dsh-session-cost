@@ -1,0 +1,43 @@
+{
+  "name": "@local/dsh-session-cost",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Shows this session's spend and the account's remaining balance below the composer.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jqstrong/dsh-session-cost.git"
+  },
+  "homepage": "https://github.com/jqstrong/dsh-session-cost#readme",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon.svg": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale/*.json",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "node check.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}
