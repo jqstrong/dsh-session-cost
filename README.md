@@ -54,10 +54,17 @@ DeepSeek Harness 的 UI 插件（bundle）：在对话框（composer）下方那
 plugin_manager({ action: "install_bundle", target: "https://github.com/jqstrong/dsh-session-cost.git" })
 ```
 
+若该设备直连 `github.com` 的 HTTPS 不通（连接被重置 / 超时），安装时可改用 SSH 形式（要求该设备已配置 GitHub SSH key；`ssh.github.com:443` 也适用）：
+
+```
+plugin_manager({ action: "install_bundle", target: "git+ssh://git@github.com/jqstrong/dsh-session-cost.git" })
+```
+
 **方式 B：先 clone 再按本地目录安装（推荐，便于改价格表后热更）**
 
 ```bash
 git clone https://github.com/jqstrong/dsh-session-cost.git
+# HTTPS 不通时：git clone ssh://git@github.com/jqstrong/dsh-session-cost.git
 ```
 
 ```
