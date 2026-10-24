@@ -6,28 +6,36 @@ DeepSeek Harness 的 UI 插件（bundle）：在对话框（composer）下方那
 
 ## 显示内容
 
-- **本次会话花费**：由本会话累计的 provider 用量（`tokenUsage` 投影：缓存未命中输入 / 缓存命中输入 / 缓存写入输入 / 输出）按模型单价计算。
+- **本次会话花费**：按**每笔用量实际发生的时段**分别计价后求和 —— 高峰时段样本按高峰价（空闲 ×2），空闲时段样本按空闲价。跨时段的会话由两段相加，因此**数字不会因为时钟跨过时段边界而跳变**，只有真的花掉 token 才会变。
 - **剩余金额**：来自账户 Remote（`ctx.remote.account.getBalance`），与「设置 → 账户」页同一数据源。芯片显示**充值余额 + 赠金余额**的合计（平台扣费优先扣赠金，两者都可用），面板里再分别列出。
 
-**悬浮 260ms 或点击芯片**会打开一个锚定在芯片上方（下方空间不足时自动翻转、并始终限制在视口内）的明细面板，样式沿用官方 `stat-dialog` 的设计语言（菜单表面 + 毛玻璃 + 描边阴影 + 12/18 字号 + 标签值网格），深浅色主题自动跟随：
+**悬浮 260ms 或点击芯片**会打开一个锚定在芯片上方（下方空间不足时自动翻转、并始终限制在视口内）的明细面板，样式沿用官方 `stat-dialog` 的设计语言（菜单表面 + 毛玻璃 + 描边阴影 + 12/18 字号 + 标签值网格），深浅色主题自动跟随。按时段分节展示，鼠标移入可查看：
 
 ```
-[icon] 本次会话花费                    ¥1.63
+[icon] 本次会话花费                    ¥4.83
 ────────────────────────────────────────────
 计价模型            deepseek-flash
-计价时段            空闲时段（高峰 ×2）
-输入 · 缓存未命中    1,234,567 tok   ¥1.23
-输入 · 缓存命中      10,000,000 tok  ¥0.20
-输出                100,000 tok      ¥0.40
+计价口径            按每笔用量发生的时段（高峰 ×2）
+高峰时段（×2）
+  输入 · 缓存未命中    1,000,000 tok   ¥2.00
+  输入 · 缓存命中      10,000,000 tok  ¥0.40
+  输出                100,000 tok      ¥0.80
+  小计                                ¥3.20
+空闲时段（×1）
+  输入 · 缓存未命中    1,234,567 tok   ¥1.23
+  输出                100,000 tok      ¥0.40
+  小计                                ¥1.63
 ────────────────────────────────────────────
 充值余额            ¥12.34
 赠金余额            ¥3.00
 可用合计            ¥15.34
 ────────────────────────────────────────────
-按当前时段单价估算，仅供参考
+按每笔用量发生的时段计价，仅供参考
 ```
 
 交互：悬浮预览、移开 200ms 后关闭（鼠标可移入面板查看，不会闪断）；点击固定打开，再次点击 / 点击外部 / `Esc` 关闭；打开时芯片高亮，`aria-expanded` 同步。
+
+> Host 投影不可用（例如 Host 进程还是旧版本、未加载本插件的新 Host 半）时，芯片降级为按当前时段估算，数字前加 `≈`，面板「计价口径」一行会说明原因，因而此时仍会随边界变化——这是有意的显式降级，不会伪装成精确值。
 
 ## 安装（当前设备）
 
@@ -73,18 +81,27 @@ plugin_manager({ action: "install_bundle", target: "<clone 目录的绝对路径
 
 装完立即生效（返回 `application: applied`）；若页面未刷新，手动刷新一次。`package.json` 里的 `private: true` 只阻止误发布到 npm，不影响 git 安装。
 
-## 价格表与行为
+## 计价口径与价格表
 
-`client.js` 顶部的常量是唯一配置面，改完保存并在页面刷新即可（`link:` 安装时无需重装）：
+**Host 半**（`index.js`）向会话投影注册一个私有键 `sessionCost`，它把每条 provider 用量样本按**该样本所在会话事件的 `time`** 折进 `peak` / `off` 两个桶（整份持久日志、不受分页与压缩影响），并把结果以整值 wire view 推给浏览器。它逐条镜像官方 `tokenUsage` 单元的口径（同样的 `assistant/message` / `assistant/attempt` 来源、同样的重试占位规则），所以两个单元的总量恒等 —— 区别只是多了时段维度。
+
+**Client 半**（`client.js`）把两个桶分别按各自单价计价再求和：
+
+- `'auto'`（默认）：`peak` 桶 × `PEAK_MULTIPLIER`，`off` 桶 × 1 —— 即按实际发生时段计价。
+- `'peak'` / `'idle'`：把全部用量固定按高峰 / 空闲价计（调试或特殊计价口径用）。
+
+`client.js` 顶部常量是唯一配置面，改完保存后由插件热载/页面刷新生效：
 
 | 常量 | 含义 |
 | --- | --- |
 | `PRICES` | 每百万 tokens 的**空闲时段**单价：`{ 币种: { 模型: { cacheHit, cacheMiss, output } } }` |
-| `PRICING_MODE` | `'auto'`（按北京时间判断高峰/空闲，默认）/ `'peak'` / `'idle'` |
+| `PRICING_MODE` | `'auto'`（每笔按自己发生的时段，默认）/ `'peak'` / `'idle'` |
 | `PEAK_MULTIPLIER` | 高峰相对空闲的倍数（官方为 2） |
 | `BALANCE_REFRESH_MS` | 余额自动刷新间隔（默认 60s） |
 | `HOVER_OPEN_MS` / `HOVER_CLOSE_MS` | 悬浮打开 / 关闭延迟 |
 | `PANEL_GAP` / `PANEL_MARGIN` | 面板与芯片的间距 / 距视口边缘的最小距离 |
+
+高峰时段在 Host 半按北京时间判定：周一至周五 09:00–12:00 与 14:00–18:00（`index.js` 的 `PEAK_MORNING` / `PEAK_AFTERNOON`）。改价格表之外的时段规则时两个文件都要同步改。
 
 出厂价格（每百万 tokens，空闲时段；高峰 ×2）：
 
@@ -95,14 +112,15 @@ plugin_manager({ action: "install_bundle", target: "<clone 目录的绝对路径
 | USD | `deepseek-flash` | 0.003 | 0.15 | 0.6 |
 | USD | `deepseek-v4-pro` | 0.022 | 0.66 | 1.98 |
 
-来源：[DeepSeek 官方模型与价格](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)。高峰时段为北京时间周一至周五（不含中国法定节假日）09:00–12:00 与 14:00–18:00，其余为空闲。表里没有的模型回退到 `default` 行。
+来源：[DeepSeek 官方模型与价格](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)。表里没有的模型回退到 `default` 行。
 
 ## 已知取舍
 
-- 会话花费是**近似值**：按当前时段单价对整个会话累计用量计价，跨高峰/空闲的会话不会逐请求分别计价；中国法定节假日未建模（节假日会按高峰计价，偏高）。
+- 会话花费是**按样本时段分摊的近似值**：每条用量样本的整笔用量归入该样本事件所在时段（真实的按请求计费也以请求时刻为准，两者在边界秒级上可能差一条请求的用量）。中国法定节假日未建模（节假日会按高峰计价，偏高）。
+- Host 半的改动需要插件重新载入：修改 `index.js` 后在当前 DSH 里执行一次 `plugin_manager` 的 `set_bundle`（`target: "@local/dsh-session-cost", enabled: true`）即可触发热载；不支持该热载的旧版本需要重启 Harness。只改 `client.js` 时由客户端 HMR 热更（或刷新页面）。
 - 缓存写入 tokens 没有公布单价，按缓存未命中单价计入（偏保守）。
 - 余额读取失败或未登录时，芯片降级为只显示花费，不会消失；点击芯片可重试，面板内会说明原因。
-- 本插件是纯显示层：不注册工具、不写会话日志、不消耗模型 token。
+- 本插件是纯显示层：不注册工具、不写会话日志、不消耗模型 token。`sessionCost` 单元的状态会进入会话投影缓存（`<DSH_HOME>/storages/session_projcache`），随会话一起持久化。
 
 ## 仓库结构
 
@@ -110,14 +128,17 @@ plugin_manager({ action: "install_bundle", target: "<clone 目录的绝对路径
 | --- | --- |
 | `package.json` | 包清单：`dsh.bundle.patch` 挂载行、`dsh.client` 客户端半、显示元数据与图标 |
 | `cordis.patch.yml` | bundle 补丁：插入 `session-cost` 行 |
-| `index.js` | Host 半：仅 `export function apply() {}`，渲染全在客户端 |
-| `client.js` | 客户端半：`conversation.composer.dock` 注册、花费计算、余额读取、锚定面板、样式与字典 |
+| `index.js` | Host 半：注册 `sessionCost` 会话投影单元（按事件时间把用量折进高峰 / 空闲桶，镜像官方 `tokenUsage` 口径） |
+| `client.js` | 客户端半：`conversation.composer.dock` 注册、分时段计价、余额读取、锚定面板、样式与字典 |
 | `locale/{zh,en}.json` | 插件列表里的标题 / 描述 |
 | `icon.svg` | 插件图标 |
 | `check.mjs` | 逻辑自检，`node check.mjs`（或 `npm run check`），需要 Node ≥ 18 |
 
 ## 验证
 
-- `node check.mjs`：23 项全通过 —— 空闲/高峰单价、v4-pro 与未知模型回退、金额舍入、赠金合计、面板开合（点击 / 悬浮 / 再次点击 / `Esc`）、面板网格内容、失败 / 未登录 / 无账户命名空间降级、挂载即读取余额并落到状态、样式表注入与卸载。该自检在 Node VM 里用最小 React / react-dom 桩与记录监听器的 DOM 桩驱动真实交互路径，但**不渲染 CSS**。
-- 运行时：`Slots.listSubTree` 显示 `conversation.composer.dock` 占用者含 `{ id: "session-cost", order: 50, active: true }`；`Config.listConfigs` 含 `include:session-cost`。
+- `node check.mjs`：**41 项全通过**。
+  - Host 半（15 项）：投影单元注册契约、空日志初值、峰值/空闲入桶、时段边界（09:00 / 12:00 / 14:00 / 18:00、周末）、重试与同 step 替换、`assistant/attempt` 流内用量、两桶之和恒等于官方 `tokenUsage` 总量、状态与 wire schema 的接受/拒绝、清空重试槽不产生新 wire 值、wire 值为纯 JSON。
+  - Client 半（26 项）：分时段计价与金额、**时钟跨边界不改变显示金额**（本次修复的回归项）、无分时段数据时的 `≈` 估算与说明、模型价格行回退、赠金合计、面板分节内容（标题 / 各行 / 小计 / 余额分节）、开合交互（点击 / 悬浮 / 再点 / `Esc` / 外部点击）、余额失败/未登录/无账户命名空间降级、挂载即读取余额、样式表注入与卸载。
+- 运行时（本机实测）：会话投影缓存 `<DSH_HOME>/storages/session_projcache/sessions/session-<本会话>.json` 中出现 `"sessionCost": {"ver":1,"seq":…,"val":{"peak":…,"off":…,"last":…}}`，且 `peak + off` 与同一文件里 `"tokenUsage"` 的 totals **逐字段相等**（本会话周六进行，全部落在 `off` 桶，`peak` 为 0）——证明 Host 半已热载并正确折叠。
+- `Slots.listSubTree` 显示 `conversation.composer.dock` 占用者含 `{ id: "session-cost", order: 50, active: true }`；`Config.listConfigs` 含 `include:session-cost`。
 - 未做视觉快照验证（开发环境无浏览器控制能力），观感需在真实页面上确认。

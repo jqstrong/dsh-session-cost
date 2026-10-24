@@ -9,8 +9,15 @@
  * label/value grid).
  *
  * Data sources
- * - Session spend: the session's `tokenUsage` projection (four disjoint
- *   provider-reported buckets) priced through the table below.
+ * - Session spend: the `sessionCost` projection contributed by this bundle's
+ *   Host half. It folds provider-reported usage into peak-hour and off-peak
+ *   buckets by the reporting event's timestamp, so each bucket is priced at the
+ *   rate in effect when those tokens were spent. A session crossing a rate
+ *   boundary is therefore priced in two parts, and the figure no longer moves
+ *   when the clock alone changes period.
+ * - Fallback: when the Host projection is absent (older Host process), the
+ *   cumulative `tokenUsage` projection is priced at the current period's rate
+ *   and the figure is marked as an estimate.
  * - Active model: the session's `modelSelection` projection, so the price row
  *   follows the model the next request will use.
  * - Remaining balance: `ctx.remote.account.getBalance`, the same Host Remote
@@ -46,8 +53,9 @@ window.__ModuleLoader__.load({
 		const PANEL_MARGIN = 12;
 
 		/**
-		 * `'auto'` follows the published peak/off-peak clock (peak = 2x off-peak);
-		 * `'peak'` and `'idle'` pin one rate for the whole session total.
+		 * `'auto'` prices each usage sample by the period it happened in (peak =
+		 * PEAK_MULTIPLIER × off-peak); `'peak'` / `'idle'` pin every sample to that
+		 * one rate instead.
 		 */
 		const PRICING_MODE = 'auto';
 		const PEAK_MULTIPLIER = 2;
@@ -79,6 +87,9 @@ window.__ModuleLoader__.load({
 			},
 		};
 
+		/** The four disjoint provider-reported token buckets. */
+		const BUCKET_KEYS = ['uncachedInputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens'];
+
 		/** Empty provider-reported usage. */
 		const NO_USAGE = {
 			uncachedInputTokens: 0,
@@ -95,22 +106,29 @@ window.__ModuleLoader__.load({
 			panelTitle: '本次会话花费',
 			rowModel: '计价模型',
 			rowModelDefault: '默认模型',
-			rowPeriod: '计价时段',
+			rowBasis: '计价口径',
+			basisSplit: '按每笔用量发生的时段（高峰 ×{factor}）',
+			basisPeak: '全部按高峰价（×{factor}）',
+			basisIdle: '全部按空闲价',
+			basisEstimated: '缺少分时段数据，按当前时段估算',
+			sectionPeak: '高峰时段（×{factor}）',
+			sectionOff: '空闲时段（×1）',
+			sectionPinnedPeak: '全部用量（按高峰价 ×{factor}）',
+			sectionPinnedIdle: '全部用量（按空闲价）',
+			sectionEstimated: '估算（无分时段数据）',
 			rowMiss: '输入 · 缓存未命中',
 			rowHit: '输入 · 缓存命中',
 			rowWrite: '输入 · 缓存写入',
 			rowOut: '输出',
+			rowSubtotal: '小计',
 			rowTopUp: '充值余额',
 			rowBonus: '赠金余额',
 			rowAvailable: '可用合计',
-			periodValue: '{period}（高峰 ×{factor}）',
-			periodPeak: '高峰时段',
-			periodIdle: '空闲时段',
 			balanceLoading: '正在读取账户余额…',
 			balanceUnavailable: '账户余额不可用',
 			balanceSignedOut: '未登录 DeepSeek 账号，无法读取余额',
 			balanceFailed: '余额读取失败，点击芯片可重试',
-			footer: '按当前时段单价估算，仅供参考',
+			footer: '按每笔用量发生的时段计价，仅供参考',
 		};
 
 		const en = {
@@ -121,22 +139,29 @@ window.__ModuleLoader__.load({
 			panelTitle: 'This session cost',
 			rowModel: 'Model',
 			rowModelDefault: 'default',
-			rowPeriod: 'Rate period',
+			rowBasis: 'Pricing basis',
+			basisSplit: 'per sample period (peak ×{factor})',
+			basisPeak: 'every sample at peak (×{factor})',
+			basisIdle: 'every sample at off-peak',
+			basisEstimated: 'no split data — estimated at the current period',
+			sectionPeak: 'Peak hours (×{factor})',
+			sectionOff: 'Off-peak hours (×1)',
+			sectionPinnedPeak: 'All usage (peak price ×{factor})',
+			sectionPinnedIdle: 'All usage (off-peak price)',
+			sectionEstimated: 'Estimate (no split data)',
 			rowMiss: 'Input · cache miss',
 			rowHit: 'Input · cache hit',
 			rowWrite: 'Input · cache write',
 			rowOut: 'Output',
+			rowSubtotal: 'Subtotal',
 			rowTopUp: 'Topped up',
 			rowBonus: 'Granted',
 			rowAvailable: 'Available',
-			periodValue: '{period} (peak ×{factor})',
-			periodPeak: 'peak',
-			periodIdle: 'off-peak',
 			balanceLoading: 'Reading the account balance…',
 			balanceUnavailable: 'Account balance unavailable',
 			balanceSignedOut: 'Not signed in to DeepSeek, so no balance is available',
 			balanceFailed: 'Balance read failed — click the chip to retry',
-			footer: 'Estimated at the current rate period',
+			footer: 'Priced by each sample’s period; estimate only',
 		};
 
 		const CSS = [
@@ -168,6 +193,9 @@ window.__ModuleLoader__.load({
 			'.dshSessionCost_panelTitleValue{font-variant-numeric:tabular-nums}',
 			'.dshSessionCost_rule{border-top:.5px solid var(--dsw-alias-border-l2);margin-bottom:10px}',
 			'.dshSessionCost_panelSection{border-top:.5px solid var(--dsw-alias-border-l2);margin:10px 0}',
+			'.dshSessionCost_sectionHead{margin:10px 0 6px;padding-top:8px;',
+			'border-top:.5px solid var(--dsw-alias-border-l2);',
+			'color:var(--dsw-alias-label-secondary);font-weight:500}',
 			'.dshSessionCost_details{display:grid;grid-template-columns:minmax(96px,auto) minmax(0,1fr);',
 			'gap:6px 16px;margin:0;color:var(--dsw-alias-label-tertiary)}',
 			'.dshSessionCost_details dt,.dshSessionCost_details dd{min-width:0;margin:0}',
@@ -175,6 +203,7 @@ window.__ModuleLoader__.load({
 			'font-variant-numeric:tabular-nums;text-align:right}',
 			'.dshSessionCost_details dd em{font-style:normal;color:var(--dsw-alias-label-tertiary);margin-right:6px}',
 			'.dshSessionCost_details .dshSessionCost_available{color:var(--dsw-alias-label-primary);font-weight:500}',
+			'.dshSessionCost_subtotalRow{color:var(--dsw-alias-label-secondary)}',
 			'.dshSessionCost_note{color:var(--dsw-alias-label-tertiary)}',
 			'.dshSessionCost_footer{display:flex;justify-content:space-between;gap:12px;',
 			'margin-top:2px;padding-top:10px;border-top:.5px solid var(--dsw-alias-border-l2);',
@@ -216,6 +245,36 @@ window.__ModuleLoader__.load({
 			return `${symbolOf(currency)}${amount.toFixed(digits)}`;
 		}
 
+		/** A fresh zero bucket set. */
+		function emptyBuckets() {
+			return { ...NO_USAGE };
+		}
+
+		/** Coerce one projection bucket set, tolerating absent or partial shapes. */
+		function asBuckets(value) {
+			const buckets = emptyBuckets();
+			if (value === null || typeof value !== 'object') return buckets;
+			for (const key of BUCKET_KEYS) {
+				const amount = value[key];
+				if (Number.isFinite(amount) && amount > 0) buckets[key] = amount;
+			}
+			return buckets;
+		}
+
+		/** Add bucket sets into one new set. */
+		function sumBuckets(...sets) {
+			const total = emptyBuckets();
+			for (const set of sets) {
+				for (const key of BUCKET_KEYS) total[key] += set[key];
+			}
+			return total;
+		}
+
+		/** Whether one bucket set carries any tokens. */
+		function hasTokens(buckets) {
+			return BUCKET_KEYS.some((key) => buckets[key] > 0);
+		}
+
 		/**
 		 * Whether the published peak window covers the given instant: Beijing
 		 * time, Monday to Friday, 09:00-12:00 and 14:00-18:00. Chinese public
@@ -237,34 +296,119 @@ window.__ModuleLoader__.load({
 			return table[model] ?? table.default;
 		}
 
-		/** The row above scaled by the rate period in effect. */
-		function effectivePrice(currency, model, now) {
-			const base = priceRow(currency, model);
-			const peak = PRICING_MODE === 'peak'
-				|| (PRICING_MODE === 'auto' && isPeakBeijing(now));
-			const factor = peak ? PEAK_MULTIPLIER : 1;
+		/** One price row scaled by a peak factor. */
+		function scaledRow(row, factor) {
 			return {
-				cacheHit: base.cacheHit * factor,
-				cacheMiss: base.cacheMiss * factor,
-				output: base.output * factor,
-				peak,
+				cacheHit: row.cacheHit * factor,
+				cacheMiss: row.cacheMiss * factor,
+				output: row.output * factor,
 			};
 		}
 
 		/**
-		 * Spend of one usage total under one price row.
+		 * Spend of one bucket set under one price row.
 		 *
 		 * Cache-write tokens have no published rate of their own and are charged
 		 * at the cache-miss rate, which is the conservative reading.
-		 * @param usage - the session's `tokenUsage` projection value.
-		 * @param price - the row in effect.
+		 * @param buckets - one token bucket set.
+		 * @param price - the row in effect for that set.
 		 * @returns money in the wallet's currency.
 		 */
-		function spendOf(usage, price) {
-			const miss = usage.uncachedInputTokens + usage.cacheWriteTokens;
+		function pricedBuckets(buckets, price) {
+			const miss = buckets.uncachedInputTokens + buckets.cacheWriteTokens;
 			return (miss * price.cacheMiss
-				+ usage.cacheReadTokens * price.cacheHit
-				+ usage.outputTokens * price.output) / 1e6;
+				+ buckets.cacheReadTokens * price.cacheHit
+				+ buckets.outputTokens * price.output) / 1e6;
+		}
+
+		/**
+		 * Resolve the session's spend presentation from the two projection values.
+		 *
+		 * With split data (`sessionCost`), each period's tokens are priced at that
+		 * period's rate, so the total only moves when tokens are spent — never when
+		 * the wall clock crosses a boundary. Without it, every token is estimated at
+		 * the period in effect right now and the result is marked as an estimate.
+		 * @param options - split projection, cumulative fallback, currency, model, now.
+		 * @returns total, estimate flag, basis, and one section per applied period.
+		 */
+		function resolveSpend({ split, totals, currency, model, now }) {
+			const base = priceRow(currency, model);
+			const peakPrice = scaledRow(base, PEAK_MULTIPLIER);
+			const offPrice = base;
+			const splitBuckets = split !== null && split !== undefined && typeof split === 'object'
+				? { peak: asBuckets(split.peak), off: asBuckets(split.off) }
+				: undefined;
+			if (PRICING_MODE === 'peak' || PRICING_MODE === 'idle') {
+				const factor = PRICING_MODE === 'peak' ? PEAK_MULTIPLIER : 1;
+				const price = scaledRow(base, factor);
+				const buckets = splitBuckets === undefined
+					? totals
+					: sumBuckets(splitBuckets.peak, splitBuckets.off);
+				const cost = pricedBuckets(buckets, price);
+				return {
+					total: cost,
+					estimated: splitBuckets === undefined,
+					basis: {
+						key: splitBuckets === undefined ? 'basisEstimated' : factor === PEAK_MULTIPLIER ? 'basisPeak' : 'basisIdle',
+						params: { factor },
+					},
+					sections: [{
+						key: 'pinned',
+						titleKey: factor === PEAK_MULTIPLIER ? 'sectionPinnedPeak' : 'sectionPinnedIdle',
+						titleParams: { factor },
+						buckets,
+						price,
+						cost,
+					}],
+				};
+			}
+			if (splitBuckets !== undefined) {
+				const peakCost = pricedBuckets(splitBuckets.peak, peakPrice);
+				const offCost = pricedBuckets(splitBuckets.off, offPrice);
+				const sections = [];
+				if (hasTokens(splitBuckets.peak)) {
+					sections.push({
+						key: 'peak',
+						titleKey: 'sectionPeak',
+						titleParams: { factor: PEAK_MULTIPLIER },
+						buckets: splitBuckets.peak,
+						price: peakPrice,
+						cost: peakCost,
+					});
+				}
+				if (hasTokens(splitBuckets.off)) {
+					sections.push({
+						key: 'off',
+						titleKey: 'sectionOff',
+						titleParams: {},
+						buckets: splitBuckets.off,
+						price: offPrice,
+						cost: offCost,
+					});
+				}
+				return {
+					total: peakCost + offCost,
+					estimated: false,
+					basis: { key: 'basisSplit', params: { factor: PEAK_MULTIPLIER } },
+					sections,
+				};
+			}
+			const peakNow = isPeakBeijing(now);
+			const price = peakNow ? peakPrice : offPrice;
+			const cost = pricedBuckets(totals, price);
+			return {
+				total: cost,
+				estimated: true,
+				basis: { key: 'basisEstimated', params: {} },
+				sections: [{
+					key: 'estimated',
+					titleKey: 'sectionEstimated',
+					titleParams: {},
+					buckets: totals,
+					price,
+					cost,
+				}],
+			};
 		}
 
 		/** The topped-up wallets the account reported. */
@@ -407,6 +551,7 @@ window.__ModuleLoader__.load({
 
 			return function SessionCostChip({ useProjection, t }) {
 				const tr = typeof t === 'function' ? t : fallbackTranslate;
+				const split = useProjection('sessionCost');
 				const usage = useProjection('tokenUsage');
 				const selection = useProjection('modelSelection');
 				const [balance, setBalance] = React.useState({ status: 'loading' });
@@ -461,11 +606,12 @@ window.__ModuleLoader__.load({
 				}, [refresh, cancelPending]);
 
 				/* A new settlement moves the balance too, but the read is rate-limited. */
-				const usageKey = usage === undefined
+				const fingerprint = (buckets) => (buckets === null || buckets === undefined
 					? ''
-					: [usage.uncachedInputTokens, usage.cacheReadTokens, usage.cacheWriteTokens, usage.outputTokens].join(':');
+					: BUCKET_KEYS.map((key) => buckets[key] ?? 0).join(':'));
+				const usageKey = `${fingerprint(split?.peak)}|${fingerprint(split?.off)}|${fingerprint(usage)}`;
 				React.useEffect(() => {
-					if (usageKey !== '') refresh(false);
+					if (usageKey.replace(/\|/gu, '') !== '') refresh(false);
 				}, [usageKey, refresh]);
 
 				/* Outside pointer or Escape closes both the hover preview and the pinned panel. */
@@ -502,9 +648,8 @@ window.__ModuleLoader__.load({
 				const wallets = walletsOf(balance);
 				const available = availableTotals(balance);
 				const currency = available[0]?.currency ?? wallets[0]?.currency ?? DEFAULT_CURRENCY;
-				const price = effectivePrice(currency, model, now);
-				const spend = spendOf(totals, price);
-				const spendText = money(spend, currency);
+				const resolved = resolveSpend({ split, totals, currency, model, now });
+				const spendText = `${resolved.estimated ? '≈' : ''}${money(resolved.total, currency)}`;
 				const balanceText = available.length > 0
 					? available.map((row) => balanceMoney(row.total, row.currency)).join(' + ')
 					: null;
@@ -520,42 +665,54 @@ window.__ModuleLoader__.load({
 					h('dt', { key: `${key}-t` }, title),
 					h('dd', { key: `${key}-v`, className }, value),
 				];
+				/** One label/value row whose two cells carry a shared class. */
+				const classedRow = (key, title, value, className) => [
+					h('dt', { key: `${key}-t`, className }, title),
+					h('dd', { key: `${key}-v`, className }, value),
+				];
 				/** One usage bucket: token count, then its priced share. */
 				const bucketValue = (tokens, amount) => [
 					h('em', { key: 'count' }, `${group(tokens)} tok`),
 					amount,
 				];
 				/* One precision for the whole share column: sub-unit sessions keep four decimals. */
-				const detailDigits = Math.abs(spend) > 0 && Math.abs(spend) < 1 ? 4 : 2;
+				const detailDigits = Math.abs(resolved.total) > 0 && Math.abs(resolved.total) < 1 ? 4 : 2;
 				const share = (tokens, unitPrice) => detailMoney(tokens / 1e6 * unitPrice, currency, detailDigits);
+				const showSubtotal = resolved.sections.length > 1;
+				/** The bucket rows of one period section. */
+				const sectionRows = (section) => {
+					const rows = [
+						gridRow('miss', tr('rowMiss'), bucketValue(
+							section.buckets.uncachedInputTokens,
+							share(section.buckets.uncachedInputTokens, section.price.cacheMiss),
+						)),
+					];
+					if (section.buckets.cacheReadTokens > 0) {
+						rows.push(gridRow('hit', tr('rowHit'), bucketValue(
+							section.buckets.cacheReadTokens,
+							share(section.buckets.cacheReadTokens, section.price.cacheHit),
+						)));
+					}
+					if (section.buckets.cacheWriteTokens > 0) {
+						rows.push(gridRow('write', tr('rowWrite'), bucketValue(
+							section.buckets.cacheWriteTokens,
+							share(section.buckets.cacheWriteTokens, section.price.cacheMiss),
+						)));
+					}
+					rows.push(gridRow('out', tr('rowOut'), bucketValue(
+						section.buckets.outputTokens,
+						share(section.buckets.outputTokens, section.price.output),
+					)));
+					if (showSubtotal) {
+						rows.push(classedRow('subtotal', tr('rowSubtotal'), money(section.cost, currency), 'dshSessionCost_subtotalRow'));
+					}
+					return rows;
+				};
 
-				const sessionRows = [
+				const topRows = [
 					gridRow('model', tr('rowModel'), model ?? tr('rowModelDefault')),
-					/* The peak multiple is only worth stating while an off-peak rate is in effect. */
-					gridRow('period', tr('rowPeriod'), price.peak
-						? tr('periodPeak')
-						: tr('periodValue', { period: tr('periodIdle'), factor: PEAK_MULTIPLIER })),
-					gridRow('miss', tr('rowMiss'), bucketValue(
-						totals.uncachedInputTokens,
-						share(totals.uncachedInputTokens, price.cacheMiss),
-					)),
+					gridRow('basis', tr('rowBasis'), tr(resolved.basis.key, resolved.basis.params)),
 				];
-				if (totals.cacheReadTokens > 0) {
-					sessionRows.push(gridRow('hit', tr('rowHit'), bucketValue(
-						totals.cacheReadTokens,
-						share(totals.cacheReadTokens, price.cacheHit),
-					)));
-				}
-				if (totals.cacheWriteTokens > 0) {
-					sessionRows.push(gridRow('write', tr('rowWrite'), bucketValue(
-						totals.cacheWriteTokens,
-						share(totals.cacheWriteTokens, price.cacheMiss),
-					)));
-				}
-				sessionRows.push(gridRow('out', tr('rowOut'), bucketValue(
-					totals.outputTokens,
-					share(totals.outputTokens, price.output),
-				)));
 
 				let balanceSection;
 				if (balance.status === 'ready' && available.length > 0) {
@@ -603,7 +760,13 @@ window.__ModuleLoader__.load({
 						h('span', { className: 'dshSessionCost_panelTitleValue' }, spendText),
 					),
 					h('div', { className: 'dshSessionCost_rule', 'aria-hidden': true }),
-					h('dl', { className: 'dshSessionCost_details' }, sessionRows.flat()),
+					h('dl', { key: 'top', className: 'dshSessionCost_details' }, topRows.flat()),
+					resolved.sections.map((section) => h(
+						React.Fragment,
+						{ key: `section-${section.key}` },
+						h('div', { className: 'dshSessionCost_sectionHead' }, tr(section.titleKey, section.titleParams)),
+						h('dl', { className: 'dshSessionCost_details' }, sectionRows(section).flat()),
+					)),
 					balanceSection,
 					h('div', { className: 'dshSessionCost_footer' }, h('span', null, tr('footer'))),
 				);
