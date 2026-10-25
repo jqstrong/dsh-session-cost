@@ -16,7 +16,17 @@
  * The unit is registered through `ctx.sessionProjections` (whole durable log,
  * survives paging and compaction). Its state is plain JSON because the
  * projection cache persists it, and its `stateVersion` gates that cache.
+ *
+ * The same Host half also serves one authenticated read-only route,
+ * `GET /api/plugin/session-cost?sessionId=…`, that aggregates the spend of a
+ * whole session tree (this session plus its subagent sessions) through
+ * `host/tree.js`. Registration is optional: without the Connection service the
+ * projection unit still runs and the browser falls back to session-only spend.
  */
+
+import { ROUTE_PATH, queryTree } from './host/tree.js';
+
+export { ROUTE_PATH };
 
 /** Peak window in Beijing time: Monday-Friday 09:00-12:00 and 14:00-18:00. */
 const PEAK_MORNING = [9 * 60, 12 * 60];
@@ -242,12 +252,125 @@ const unit = {
 	wire: { viewSchema, view },
 };
 
+/* -------------------------------------------------------------------------- *
+ * Host route: session-tree spend
+ * -------------------------------------------------------------------------- */
+
+/** Query parameters that describe a malformed request (HTTP 400). */
+const PARAM_ERROR_CODES = new Set(['invalid-session-id', 'invalid-url']);
+
+/** JSON response with the fixed no-store / nosniff headers. */
+function jsonResponse(status, body) {
+	return new Response(JSON.stringify(body), {
+		status,
+		headers: {
+			'content-type': 'application/json; charset=utf-8',
+			'cache-control': 'no-store',
+			'x-content-type-options': 'nosniff',
+		},
+	});
+}
+
+/** Publish one `{ok:false}` envelope, using HTTP 400 for bad parameters. */
+function errorResponse(error) {
+	return jsonResponse(PARAM_ERROR_CODES.has(error?.code) ? 400 : 200, { ok: false, error });
+}
+
+/** Log an unexpected failure without ever echoing its stack to the client. */
+function warn(ctx, message) {
+	try {
+		if (ctx !== null && typeof ctx === 'object' && ctx.logger !== undefined && typeof ctx.logger.warn === 'function') {
+			ctx.logger.warn(message);
+			return;
+		}
+	} catch {
+		// Logging must never fail a request.
+	}
+	try {
+		console.warn(message);
+	} catch {
+		// ignore
+	}
+}
+
+/**
+ * Handle one GET `/api/plugin/session-cost` request.
+ *
+ * Exported for tests: the Host test suite drives it with a fake Cordis context
+ * and real `Request`/`Response` objects, no running DSH needed.
+ * @param ctx - Host plugin context (only optional service lookups are read).
+ * @param request - WHATWG request supplied by Connection.
+ * @returns {Promise<Response>}
+ */
+export async function handleRequest(ctx, request) {
+	try {
+		if (request === null || typeof request !== 'object' || request.method !== 'GET') {
+			return jsonResponse(405, { ok: false, error: { code: 'method-not-allowed', message: 'only GET is supported' } });
+		}
+		let url;
+		try {
+			url = new URL(request.url);
+		} catch {
+			return errorResponse({ code: 'invalid-url', message: 'request url is not a valid URL' });
+		}
+		const raw = url.searchParams.get('sessionId');
+		const result = await queryTree(ctx, raw === null ? '' : raw, request.signal);
+		if (result.ok) return jsonResponse(200, result);
+		return errorResponse(result.error);
+	} catch (error) {
+		warn(ctx, `session-cost: unhandled host failure: ${error instanceof Error ? error.message : String(error)}`);
+		return jsonResponse(500, { ok: false, error: { code: 'internal-error', message: 'the session-cost host handler failed' } });
+	}
+}
+
+/**
+ * Register the route once the Host Connection service is available.
+ *
+ * The route is additive: a composition without `connection` (or an older Host
+ * that cannot inject it) keeps the projection unit running, and the client
+ * simply falls back to the session's own cost.
+ * @param ctx - host plugin context.
+ */
+function registerRoute(ctx) {
+	const install = (hostCtx) => {
+		if (hostCtx === null || typeof hostCtx !== 'object') return;
+		const connection = hostCtx.connection ?? (typeof hostCtx.get === 'function' ? hostCtx.get('connection') : undefined);
+		if (connection === null || connection === undefined || connection.fetch === undefined
+			|| typeof connection.fetch.register !== 'function') return;
+		const effect = typeof hostCtx.effect === 'function'
+			? hostCtx.effect.bind(hostCtx)
+			: (fn) => {
+				const cleanup = fn();
+				return () => {
+					if (typeof cleanup === 'function') cleanup();
+				};
+			};
+		effect(() => connection.fetch.register({
+			path: ROUTE_PATH,
+			methods: ['GET'],
+			requestBody: 'buffered',
+			fetch: (request) => handleRequest(hostCtx, request),
+		}), 'session-cost: GET /api/plugin/session-cost');
+	};
+	if (typeof ctx?.inject === 'function') {
+		try {
+			ctx.inject(['connection'], (hostCtx) => install(hostCtx ?? ctx));
+			return;
+		} catch {
+			// Fall through to a direct install attempt on the current context.
+		}
+	}
+	install(ctx);
+}
+
 export const inject = ['sessionProjections'];
 
 /**
- * Register the unit on the projection registry.
+ * Register the unit on the projection registry, plus the tree-spend route when
+ * the Connection service is present.
  * @param ctx - host plugin context carrying `sessionProjections`.
  */
 export function apply(ctx) {
 	ctx.sessionProjections.register(unit);
+	registerRoute(ctx);
 }

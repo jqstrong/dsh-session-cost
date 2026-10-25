@@ -29,6 +29,11 @@
  *   other tools using the same account, or another device all draw it down —
  *   so this total is what reconciles the chip with the balance drop, while the
  *   spend figure above stays strictly this session's token cost.
+ * - Session tree: agent-team teammates and subagents run in their own durable
+ *   Sessions (headers carry `parentSession`), so the conversation's real cost
+ *   is the sum over the tree. The Host half serves that sum over one
+ *   same-origin GET route (`host/tree.js`); when it is unavailable (older
+ *   Host, missing query service) the chip falls back to this session alone.
  *
  * No Harness Client package is imported: React and react-dom come from the
  * page's module table, the icons are inline SVG, and every style reads theme
@@ -45,12 +50,14 @@ window.__ModuleLoader__.load({
 		/** Locale namespace whose dictionaries carry every visible string. */
 		const NS = 'session-cost';
 		/** Identity the account Remote carries for this UI. */
-		const CLIENT_VERSION = '1.1.0';
+		const CLIENT_VERSION = '1.2.0';
 		/** Currency assumed when the account reports no wallet. */
 		const DEFAULT_CURRENCY = 'CNY';
 		/** Balance re-read cadence, and the shortest gap between two reads. */
 		const BALANCE_REFRESH_MS = 60000;
 		const BALANCE_MIN_GAP_MS = 10000;
+		/** Session-tree spend refresh cadence (the route observes sibling sessions). */
+		const TREE_REFRESH_MS = 20000;
 		/**
 		 * Smallest account-wide excess over this session's own spend worth
 		 * surfacing separately. Below it the difference is noise (rounding,
@@ -136,6 +143,7 @@ window.__ModuleLoader__.load({
 			rowSubtotal: '小计',
 			rowAccount: '账户已扣（自打开本页）',
 			rowAccountExtra: '其中其他会话 / 子代理 / 工具',
+			rowSubagents: '子代理会话（{count} 个）',
 			accountNote: '余额为整个账户共用：其他会话、子代理、其他工具或设备同样会扣费。账户已扣只统计本页打开后观察到的余额减少（平台按批次结算，可能短暂滞后），充值或赠金变动不计入。',
 			rowTopUp: '充值余额',
 			rowBonus: '赠金余额',
@@ -173,6 +181,7 @@ window.__ModuleLoader__.load({
 			rowSubtotal: 'Subtotal',
 			rowAccount: 'Charged to account (since this page opened)',
 			rowAccountExtra: 'of which other sessions / subagents / tools',
+			rowSubagents: 'Subagent sessions ({count})',
 			accountNote: 'The balance is shared by the whole account: other sessions, subagents, other tools, or other devices also draw it down. Account charged only counts balance decreases observed while this page is open (the platform settles in batches, so it can lag briefly); top-ups and grants are not counted.',
 			rowTopUp: 'Topped up',
 			rowBonus: 'Granted',
@@ -339,6 +348,19 @@ window.__ModuleLoader__.load({
 			return (miss * price.cacheMiss
 				+ buckets.cacheReadTokens * price.cacheHit
 				+ buckets.outputTokens * price.output) / 1e6;
+		}
+
+		/**
+		 * Spend of one peak/off-peak bucket pair under one model row, by period.
+		 * @param split - `{ peak, off }` bucket sets.
+		 * @param currency - wallet currency selecting the price table.
+		 * @param model - model id selecting the row (`default` fallback).
+		 * @returns money in the wallet's currency.
+		 */
+		function splitCost(split, currency, model) {
+			const base = priceRow(currency, model);
+			return pricedBuckets(split.peak, scaledRow(base, PEAK_MULTIPLIER))
+				+ pricedBuckets(split.off, base);
 		}
 
 		/**
@@ -625,7 +647,7 @@ window.__ModuleLoader__.load({
 				}
 			}
 
-			return function SessionCostChip({ useProjection, t }) {
+			return function SessionCostChip({ useProjection, t, sessionId }) {
 				const tr = typeof t === 'function' ? t : fallbackTranslate;
 				const split = useProjection('sessionCost');
 				const usage = useProjection('tokenUsage');
@@ -633,12 +655,18 @@ window.__ModuleLoader__.load({
 				const [balance, setBalance] = React.useState({ status: 'loading' });
 				/** Account-wide deductions observed since mount: `{ previous, spent, sessionSpendAtOpen }`. */
 				const [accountCharge, setAccountCharge] = React.useState({ previous: null, spent: {}, sessionSpendAtOpen: null });
+				/** Host-computed session tree (this session + its subagent sessions). */
+				const [treeCost, setTreeCost] = React.useState({ status: 'idle' });
 				const [pinned, setPinned] = React.useState(false);
 				const [hovered, setHovered] = React.useState(false);
 				const alive = React.useRef(true);
 				const lastRead = React.useRef(0);
 				/** Issue order of balance reads; an older response must never win. */
 				const readSeq = React.useRef(0);
+				/** Issue order of tree reads; a superseded response is dropped. */
+				const treeSeq = React.useRef(0);
+				/** In-flight tree request, aborted when a newer one starts or on unmount. */
+				const treeAbort = React.useRef(null);
 				/** Latest session spend, read by the charge fold when a read settles. */
 				const sessionSpend = React.useRef(0);
 				const timers = React.useRef([]);
@@ -692,6 +720,79 @@ window.__ModuleLoader__.load({
 					};
 				}, [refresh, cancelPending]);
 
+				/* Host half: fetch the session tree (this session plus its subagent
+				   sessions). An older Host or a missing route degrades silently to
+				   the v1.1 session-only figure. */
+				const loadTree = React.useCallback(() => {
+					const doFetch = typeof fetch === 'function' ? fetch : undefined;
+					if (doFetch === undefined || typeof sessionId !== 'string' || sessionId === '') {
+						setTreeCost({ status: 'unavailable' });
+						return;
+					}
+					let base = 'http://localhost/';
+					try {
+						if (typeof document !== 'undefined' && typeof document.baseURI === 'string' && document.baseURI !== '') {
+							base = document.baseURI;
+						}
+					} catch (error) {
+						base = 'http://localhost/';
+					}
+					let url;
+					try {
+						url = new URL('api/plugin/session-cost', base);
+					} catch (error) {
+						setTreeCost({ status: 'unavailable' });
+						return;
+					}
+					url.searchParams.set('sessionId', sessionId);
+					const seq = ++treeSeq.current;
+					try {
+						treeAbort.current?.abort?.();
+					} catch (error) {
+						/* a failed abort must not stop a fresh request */
+					}
+					const controller = typeof AbortController === 'function' ? new AbortController() : null;
+					treeAbort.current = controller;
+					doFetch(url.toString(), {
+						method: 'GET',
+						credentials: 'same-origin',
+						...(controller === null ? {} : { signal: controller.signal }),
+					}).then((response) => {
+						if (response === null || response === undefined || response.ok !== true) return null;
+						return response.json();
+					}).then((payload) => {
+						if (treeSeq.current !== seq) return;
+						const value = payload !== null && typeof payload === 'object' && payload.ok === true ? payload.value : null;
+						if (value === null || typeof value !== 'object' || !Array.isArray(value.children)) {
+							setTreeCost({ status: 'unavailable' });
+							return;
+						}
+						setTreeCost({
+							status: 'ready',
+							value: { root: value.root ?? null, children: value.children, truncated: value.truncated === true },
+						});
+					}).catch(() => {
+						if (treeSeq.current === seq) setTreeCost({ status: 'unavailable' });
+					});
+				}, [sessionId]);
+				React.useEffect(() => {
+					if (typeof sessionId !== 'string' || sessionId === '') {
+						setTreeCost({ status: 'unavailable' });
+						return undefined;
+					}
+					loadTree();
+					const id = window.setInterval(loadTree, TREE_REFRESH_MS);
+					return () => {
+						window.clearInterval(id);
+						treeSeq.current += 1;
+						try {
+							treeAbort.current?.abort?.();
+						} catch (error) {
+							/* ignore */
+						}
+					};
+				}, [loadTree, sessionId]);
+
 				/* A new settlement moves the balance too, but the read is rate-limited. */
 				const fingerprint = (buckets) => (buckets === null || buckets === undefined
 					? ''
@@ -735,10 +836,43 @@ window.__ModuleLoader__.load({
 				const wallets = walletsOf(balance);
 				const available = availableTotals(balance);
 				const currency = available[0]?.currency ?? wallets[0]?.currency ?? DEFAULT_CURRENCY;
-				const resolved = resolveSpend({ split, totals, currency, model, now });
+				/* Session tree (root + subagent sessions) when the Host route answered:
+				   price every entry with its own model row, and aggregate the buckets
+				   for the per-period share display. */
+				const tree = treeCost.status === 'ready' && treeCost.value !== undefined && treeCost.value !== null
+					? treeCost.value
+					: null;
+				const treeEntries = tree === null
+					? null
+					: [tree.root, ...tree.children].filter((entry) => entry !== null && typeof entry === 'object'
+						&& entry.split !== null && typeof entry.split === 'object');
+				let displaySplit = split;
+				let treeSpend = null;
+				let childSpend = 0;
+				let childCount = 0;
+				if (treeEntries !== null && treeEntries.length > 0) {
+					let total = 0;
+					const peaks = [];
+					const offs = [];
+					for (const entry of treeEntries) {
+						total += splitCost(entry.split, currency, entry.model ?? model);
+						peaks.push(entry.split.peak);
+						offs.push(entry.split.off);
+					}
+					displaySplit = { peak: sumBuckets(...peaks), off: sumBuckets(...offs) };
+					treeSpend = total;
+					for (const entry of tree.children) {
+						if (entry === null || typeof entry !== 'object'
+							|| entry.split === null || typeof entry.split !== 'object') continue;
+						childSpend += splitCost(entry.split, currency, entry.model ?? model);
+						childCount += 1;
+					}
+				}
+				const resolved = resolveSpend({ split: displaySplit, totals, currency, model, now });
+				const sessionTotal = treeSpend ?? resolved.total;
 				/* Keep the fold's notion of "session spend now" current for the next read. */
-				sessionSpend.current = resolved.total;
-				const spendText = `${resolved.estimated ? '≈' : ''}${money(resolved.total, currency)}`;
+				sessionSpend.current = sessionTotal;
+				const spendText = `${treeSpend === null && resolved.estimated ? '≈' : ''}${money(sessionTotal, currency)}`;
 				const balanceText = available.length > 0
 					? available.map((row) => balanceMoney(row.total, row.currency)).join(' + ')
 					: null;
@@ -747,7 +881,7 @@ window.__ModuleLoader__.load({
 				   session's lifetime spend to the first observed balance so both
 				   figures cover the same window (the page may open mid-session). */
 				const sessionSpendAtOpen = accountCharge.sessionSpendAtOpen ?? 0;
-				const sessionSpendSinceOpen = Math.max(0, resolved.total - sessionSpendAtOpen);
+				const sessionSpendSinceOpen = Math.max(0, sessionTotal - sessionSpendAtOpen);
 				const charged = Object.entries(accountCharge.spent)
 					.filter(([, amount]) => Number.isFinite(amount) && amount > 1e-9);
 				const chargeText = charged
@@ -819,6 +953,15 @@ window.__ModuleLoader__.load({
 					gridRow('model', tr('rowModel'), model ?? tr('rowModelDefault')),
 					gridRow('basis', tr('rowBasis'), tr(resolved.basis.key, resolved.basis.params)),
 				];
+				/* The tree total includes subagent Sessions; name their share so the
+				   difference from this session's own events is never a mystery. */
+				if (childCount > 0) {
+					topRows.push(gridRow(
+						'subagents',
+						tr('rowSubagents', { count: childCount }),
+						money(childSpend, currency),
+					));
+				}
 
 				/* Account-wide deductions reconcile the chip with the account balance:
 				   the balance is shared, so a drop can exceed this session's spend. */

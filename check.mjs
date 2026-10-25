@@ -1,22 +1,26 @@
-﻿/**
+/**
  * Logic check for the `@local/dsh-session-cost` bundle.
  *
- * Part 1 drives the real Host half (`index.js`) against a mock projection
- * registry: peak/off-peak bucketing by event time, retried-step replacement,
- * parity with the shipped `tokenUsage` fold, and the schema faces the registry
- * calls.
+ * Part 1 drives the real Host halves (`index.js` + `host/tree.js`) against
+ * mock contexts: the projection unit (peak/off-peak bucketing by event time,
+ * retried-step replacement, parity with the shipped `tokenUsage` fold, schema
+ * faces) and the v1.2 authenticated session-tree GET route (root/child entries,
+ * subagent-ledger and catalog walks, cap/truncation, error envelopes, optional
+ * connection composition).
  *
  * Part 2 runs the real Client half (`client.js`) in a Node VM with minimal
  * React/react-dom and DOM stubs, driving the chip through its interaction paths
  * (mount, hover, click, Escape) and asserting the chip text, the per-period
- * panel sections, the account-level charge section, and every degraded state —
- * including the regression that the displayed spend must NOT change when the
- * wall clock crosses a rate boundary, the v1.1 regression that a shared
- * account's balance drop is shown next to (not instead of) this session's
- * spend, and the latest-request-wins guard for overlapping balance reads. The
- * 60s balance-refresh interval is captured, so a test can fire the tick (or
- * leave several reads in flight with a deferred stub) and settle the async read
- * before asserting.
+ * panel sections, the account-level charge section, the v1.2 session-tree
+ * total/subagent row (with a sandbox `fetch` stub: per-entry model pricing,
+ * 20s refresh, latest-wins, unmount abort, silent v1.1 fallback), and every
+ * degraded state — including the regression that the displayed spend must NOT
+ * change when the wall clock crosses a rate boundary, the v1.1 regression that
+ * a shared account's balance drop is shown next to (not instead of) this
+ * session's spend, and the latest-request-wins guard for overlapping balance
+ * reads. The 60s balance-refresh and 20s tree-refresh intervals are captured,
+ * so a test can fire either tick (or leave several reads in flight with a
+ * deferred stub) and settle the async read before asserting.
  *
  * This is a numbers-and-branch check, NOT visual verification: it never applies
  * CSS and cannot show what the page looks like.
@@ -27,7 +31,13 @@ import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 
-import { apply as hostApply, inject as hostInject } from './index.js';
+import {
+	apply as hostApply,
+	handleRequest as hostHandleRequest,
+	inject as hostInject,
+	ROUTE_PATH as HOST_ROUTE_PATH,
+} from './index.js';
+import { MAX_TREE_SESSIONS, ROUTE_PATH as TREE_ROUTE_PATH, queryTree } from './host/tree.js';
 
 const results = [];
 function report(name, error) {
@@ -294,6 +304,434 @@ check('host: the wire value is plain JSON', () => {
 });
 
 /* ==================================================================== */
+/* Part 1b — Host session-tree route (v1.2)                             */
+/* ==================================================================== */
+
+/** Empty provider-reported buckets (host-side copy for this section). */
+const zeroHostBuckets = () => ({
+	uncachedInputTokens: 0,
+	cacheReadTokens: 0,
+	cacheWriteTokens: 0,
+	outputTokens: 0,
+});
+
+/** One `sessionCost` wire view built from partial bucket sets. */
+const costView = (peak = {}, off = {}) => ({
+	peak: { ...zeroHostBuckets(), ...peak },
+	off: { ...zeroHostBuckets(), ...off },
+});
+
+/** One fake WHATWG request for `handleRequest`. */
+const hostRequest = (url, method = 'GET', signal = undefined) => ({ url, method, signal });
+
+/** One `sessionQuery.observeSession` observation stub that counts its disposal. */
+function observationStub(values, disposed) {
+	return {
+		projections: { values },
+		[Symbol.dispose]() {
+			disposed.count += 1;
+		},
+	};
+}
+
+/**
+ * Mock Host plugin context: lazy `get(name)` services, an `effect` collector,
+ * a projection registry, and a selectable `inject` behavior.
+ * @param options - `services` map, optional `connection`, and `inject` mode
+ *   (`'ctx'` invokes the callback with this context, `'deferred'` never invokes
+ *   it, `'throw'` throws, `'none'` leaves `inject` undefined).
+ * @returns `{ ctx, state }`; `state` records the unit, effects and warnings.
+ */
+function mockHostContext({ services = {}, connection = undefined, inject = 'ctx' } = {}) {
+	const state = { unit: undefined, effects: [], warnings: [], injected: [] };
+	const ctx = {
+		logger: { warn: (message) => state.warnings.push(message) },
+		get: (name) => services[name],
+		sessionProjections: {
+			register: (definition) => {
+				state.unit = definition;
+				return () => {};
+			},
+		},
+		effect: (fn, label) => {
+			const cleanup = fn();
+			state.effects.push({ label, cleanup });
+			return () => {
+				if (typeof cleanup === 'function') cleanup();
+			};
+		},
+	};
+	if (connection !== undefined) ctx.connection = connection;
+	if (inject === 'ctx') {
+		ctx.inject = (names, callback) => {
+			state.injected.push([...names]);
+			callback(ctx);
+		};
+	} else if (inject === 'deferred') {
+		ctx.inject = (names) => {
+			state.injected.push([...names]);
+		};
+	} else if (inject === 'throw') {
+		ctx.inject = () => {
+			throw new Error('no connection seat');
+		};
+	}
+	return { ctx, state };
+}
+
+check('host: the tree module exposes the documented v1.2 interface', () => {
+	assert.equal(HOST_ROUTE_PATH, '/api/plugin/session-cost', 'the route path is the documented one');
+	assert.equal(TREE_ROUTE_PATH, HOST_ROUTE_PATH, 'index.js re-exports the tree route path');
+	assert.equal(MAX_TREE_SESSIONS, 40, 'one tree query inspects at most 40 sessions');
+	assert.equal(typeof hostHandleRequest, 'function', 'index.js exports the route handler');
+	assert.equal(typeof queryTree, 'function', 'host/tree.js exports the query');
+});
+
+await checkAsync('host: queryTree returns error envelopes instead of throwing', async () => {
+	for (const [ctx, sessionId, code] of [
+		[{}, 'bad id!', 'invalid-session-id'],
+		[{}, '', 'invalid-session-id'],
+		[{}, 'root-1', 'tree-unavailable'],
+		[{ get: () => undefined }, 'root-1', 'tree-unavailable'],
+	]) {
+		const result = await queryTree(ctx, sessionId);
+		assert.equal(result.ok, false, `${code}: no success envelope`);
+		assert.equal(result.error.code, code);
+	}
+});
+
+await checkAsync('host: apply installs the tree GET route through the connection seat', async () => {
+	const registered = [];
+	const disposers = [];
+	const connection = {
+		fetch: {
+			register: (definition) => {
+				registered.push(definition);
+				const disposer = () => {
+					definition.disposed = true;
+				};
+				disposers.push(disposer);
+				return disposer;
+			},
+		},
+	};
+	const { ctx, state } = mockHostContext({ connection });
+	hostApply(ctx);
+	assert.ok(state.unit !== undefined, 'the projection unit is still registered');
+	assert.deepEqual(state.injected, [['connection']], 'the route waits for the connection service');
+	assert.equal(registered.length, 1, 'one route is registered');
+	assert.equal(registered[0].path, '/api/plugin/session-cost');
+	assert.deepEqual(registered[0].methods, ['GET']);
+	assert.equal(registered[0].requestBody, 'buffered');
+	assert.equal(typeof registered[0].fetch, 'function', 'the route carries the request handler');
+	assert.equal(state.effects.length, 1, 'the route lives in one ctx.effect');
+	assert.match(state.effects[0].label, /GET \/api\/plugin\/session-cost/u);
+	assert.equal(state.effects[0].cleanup, disposers[0], 'the register disposer is owned by the effect');
+	// The route handler really delegates to handleRequest: an invalid request
+	// still yields the documented 400 envelope.
+	const response = await registered[0].fetch(hostRequest('http://localhost/api/plugin/session-cost'));
+	assert.equal(response.status, 400);
+	assert.equal((await response.json()).error.code, 'invalid-session-id');
+	state.effects[0].cleanup();
+	assert.equal(registered[0].disposed, true, 'disposal unregisters the route');
+});
+
+/** Root + two children behind a `subagents.listDescendants` ledger. */
+function treeServicesFixture() {
+	const disposed = { count: 0 };
+	const calls = [];
+	const observations = {
+		'root-1': observationStub({
+			sessionCost: costView({ uncachedInputTokens: 1_000_000 }, { cacheReadTokens: 10_000_000, outputTokens: 100_000 }),
+			modelSelection: { lastUsed: { model: 'deepseek-flash' } },
+		}, disposed),
+		'child-1': observationStub({
+			sessionCost: costView({ uncachedInputTokens: 2_000_000 }, { outputTokens: 50_000 }),
+			modelSelection: { lastUsed: { model: 'deepseek-v4-pro' } },
+		}, disposed),
+		'child-2': observationStub({
+			sessionCost: costView({}, { uncachedInputTokens: 3_000_000 }),
+			modelSelection: { next: { model: 'deepseek-flash' } },
+		}, disposed),
+	};
+	const sessionQuery = {
+		observeSession: async (id, options) => {
+			calls.push({ id, options });
+			const observation = observations[id];
+			if (observation === undefined) throw new Error(`unknown session ${id}`);
+			return observation;
+		},
+	};
+	const listCalls = [];
+	const subagents = {
+		listDescendants: async (rootId, signal) => {
+			listCalls.push({ rootId, signal });
+			return [
+				{ kind: 'child', id: 'child-1', parentId: 'root-1', depth: 1, mode: 'subagent', label: 'billing-auditor', activity: 'idle' },
+				{ kind: 'diagnostic', id: 'ignored', parentId: 'root-1', depth: 1 },
+				{ kind: 'child', id: 'child-2', parentId: 'root-1', depth: 1, mode: 'subagent', label: 'test-author', activity: 'busy' },
+			];
+		},
+	};
+	return { disposed, calls, listCalls, services: { sessionQuery, subagents } };
+}
+
+await checkAsync('host: the tree route returns root and subagent entries', async () => {
+	const { disposed, calls, listCalls, services } = treeServicesFixture();
+	const signal = { aborted: false };
+	const { ctx } = mockHostContext({ services });
+	const response = await hostHandleRequest(
+		ctx,
+		hostRequest('http://localhost/api/plugin/session-cost?sessionId=root-1', 'GET', signal),
+	);
+	assert.equal(response.status, 200);
+	assert.equal(response.headers.get('content-type'), 'application/json; charset=utf-8');
+	assert.equal(response.headers.get('cache-control'), 'no-store');
+	assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+	const body = await response.json();
+	assert.equal(body.ok, true);
+	assert.equal(body.value.truncated, false);
+	assert.deepEqual(body.value.root, {
+		id: 'root-1',
+		parentId: null,
+		depth: 0,
+		mode: 'main',
+		label: null,
+		activity: null,
+		model: 'deepseek-flash',
+		split: {
+			peak: { uncachedInputTokens: 1_000_000, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 },
+			off: { uncachedInputTokens: 0, cacheReadTokens: 10_000_000, cacheWriteTokens: 0, outputTokens: 100_000 },
+		},
+	});
+	assert.deepEqual(body.value.children, [
+		{
+			id: 'child-1',
+			parentId: 'root-1',
+			depth: 1,
+			mode: 'subagent',
+			label: 'billing-auditor',
+			activity: 'idle',
+			model: 'deepseek-v4-pro',
+			split: {
+				peak: { uncachedInputTokens: 2_000_000, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 },
+				off: { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 50_000 },
+			},
+		},
+		{
+			id: 'child-2',
+			parentId: 'root-1',
+			depth: 1,
+			mode: 'subagent',
+			label: 'test-author',
+			activity: 'busy',
+			model: 'deepseek-flash',
+			split: {
+				peak: { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 },
+				off: { uncachedInputTokens: 3_000_000, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 },
+			},
+		},
+	], 'diagnostic ledger rows are ignored');
+	assert.deepEqual(listCalls, [{ rootId: 'root-1', signal }], 'the ledger walk gets the root id and signal');
+	assert.deepEqual(calls.map(({ id }) => id), ['root-1', 'child-1', 'child-2'], 'only real sessions are observed');
+	assert.deepEqual(calls[1].options, { signal }, 'the request signal is forwarded to observations');
+	assert.equal(disposed.count, 3, 'every observation is disposed');
+});
+
+/** Root + child + grandchild observable only through `subagentCatalog`. */
+function catalogFixture(subagents) {
+	const disposed = { count: 0 };
+	const observations = {
+		'root-1': observationStub({
+			sessionCost: costView({}, { uncachedInputTokens: 1_000_000 }),
+			modelSelection: { lastUsed: { model: 'deepseek-flash' } },
+			subagentCatalog: [{ id: 'child-1', mode: 'subagent', label: 'billing-auditor' }],
+		}, disposed),
+		'child-1': observationStub({
+			sessionCost: costView({ uncachedInputTokens: 1_000_000 }, {}),
+			modelSelection: { lastUsed: { model: 'deepseek-v4-pro' } },
+			subagentCatalog: [{ id: 'grandchild-1', mode: 'subagent', label: 'verifier' }],
+		}, disposed),
+		'grandchild-1': observationStub({
+			sessionCost: costView({}, { outputTokens: 10_000 }),
+			modelSelection: {},
+		}, disposed),
+	};
+	const sessionQuery = {
+		observeSession: async (id) => {
+			const observation = observations[id];
+			if (observation === undefined) throw new Error(`unknown session ${id}`);
+			return observation;
+		},
+	};
+	const services = { sessionQuery };
+	if (subagents !== undefined) services.subagents = subagents;
+	return { disposed, services };
+}
+
+await checkAsync('host: the tree falls back to the subagent catalog', async () => {
+	for (const subagents of [
+		undefined, // no subagents service at all
+		{ listDescendants: async () => { throw new Error('ledger unavailable'); } }, // broken walk
+	]) {
+		const { disposed, services } = catalogFixture(subagents);
+		const { ctx } = mockHostContext({ services });
+		const response = await hostHandleRequest(
+			ctx,
+			hostRequest('http://localhost/api/plugin/session-cost?sessionId=root-1'),
+		);
+		assert.equal(response.status, 200);
+		const body = await response.json();
+		assert.equal(body.ok, true);
+		assert.deepEqual(body.value.children.map((entry) => [entry.id, entry.parentId, entry.depth, entry.label]), [
+			['child-1', 'root-1', 1, 'billing-auditor'],
+			['grandchild-1', 'child-1', 2, 'verifier'],
+		], 'the catalog walk is recursive and keeps parent/depth');
+		assert.equal(body.value.children[0].model, 'deepseek-v4-pro');
+		assert.equal(body.value.children[1].model, null, 'a missing modelSelection stays null');
+		assert.equal(body.value.root.model, 'deepseek-flash');
+		assert.equal(disposed.count, 3, 'every observation is disposed');
+	}
+});
+
+await checkAsync('host: the tree caps at MAX_TREE_SESSIONS and skips unreadable children', async () => {
+	const disposed = { count: 0 };
+	const rows = [];
+	const observations = new Map();
+	observations.set('root-1', observationStub({ sessionCost: costView(), modelSelection: {} }, disposed));
+	for (let index = 0; index < MAX_TREE_SESSIONS + 5; index += 1) {
+		const id = `child-${index}`;
+		rows.push({ kind: 'child', id, parentId: 'root-1', depth: 1, mode: 'subagent', label: id, activity: null });
+		if (index === 2) continue; // observation rejects: the child is skipped
+		if (index === 5) {
+			observations.set(id, observationStub({ modelSelection: {} }, disposed)); // no sessionCost: skipped
+			continue;
+		}
+		observations.set(id, observationStub({
+			sessionCost: costView({}, { uncachedInputTokens: 1 }),
+			modelSelection: { lastUsed: { model: 'deepseek-flash' } },
+		}, disposed));
+	}
+	let observed = 0;
+	const sessionQuery = {
+		observeSession: async (id) => {
+			observed += 1;
+			const observation = observations.get(id);
+			if (observation === undefined) throw new Error(`unknown session ${id}`);
+			return observation;
+		},
+	};
+	const services = {
+		sessionQuery,
+		subagents: { listDescendants: async () => rows },
+	};
+	const { ctx } = mockHostContext({ services });
+	const response = await hostHandleRequest(
+		ctx,
+		hostRequest('http://localhost/api/plugin/session-cost?sessionId=root-1'),
+	);
+	assert.equal(response.status, 200);
+	const body = await response.json();
+	assert.equal(body.ok, true);
+	assert.equal(body.value.truncated, true, 'hitting the cap marks the tree truncated');
+	assert.equal(body.value.children.length, MAX_TREE_SESSIONS - 3, 'root plus two unusable children are excluded');
+	assert.equal(observed, MAX_TREE_SESSIONS, 'the cap bounds the number of observations');
+	assert.equal(disposed.count, MAX_TREE_SESSIONS - 1, 'every opened observation is disposed');
+});
+
+await checkAsync('host: tree-route failures map to the documented status codes', async () => {
+	const notFound = {
+		sessionQuery: {
+			observeSession: async () => {
+				throw new Error('unknown session');
+			},
+		},
+	};
+	const { ctx } = mockHostContext({ services: notFound });
+	const expectError = async (response, status, code) => {
+		assert.equal(response.status, status);
+		const body = await response.json();
+		assert.equal(body.ok, false);
+		assert.equal(body.error.code, code);
+	};
+	await expectError(
+		await hostHandleRequest(ctx, hostRequest('http://localhost/api/plugin/session-cost?sessionId=root-1', 'POST')),
+		405,
+		'method-not-allowed',
+	);
+	await expectError(await hostHandleRequest(ctx, hostRequest('not a url')), 400, 'invalid-url');
+	for (const url of [
+		'http://localhost/api/plugin/session-cost',
+		'http://localhost/api/plugin/session-cost?sessionId=',
+		'http://localhost/api/plugin/session-cost?sessionId=bad%20id%21',
+		`http://localhost/api/plugin/session-cost?sessionId=${'a'.repeat(101)}`,
+	]) {
+		await expectError(await hostHandleRequest(ctx, hostRequest(url)), 400, 'invalid-session-id');
+	}
+	await expectError(
+		await hostHandleRequest(
+			mockHostContext({ services: {} }).ctx,
+			hostRequest('http://localhost/api/plugin/session-cost?sessionId=root-1'),
+		),
+		200,
+		'tree-unavailable',
+	);
+	await expectError(
+		await hostHandleRequest(
+			ctx,
+			hostRequest('http://localhost/api/plugin/session-cost?sessionId=root-1'),
+		),
+		200,
+		'session-not-found',
+	);
+	// An unexpected throw becomes an opaque 500 and is logged.
+	const broken = {
+		sessionQuery: {
+			observeSession: async () => ({
+				get projections() {
+					throw new Error('projection exploded');
+				},
+				[Symbol.dispose]() {},
+			}),
+		},
+	};
+	const brokenContext = mockHostContext({ services: broken });
+	await expectError(
+		await hostHandleRequest(
+			brokenContext.ctx,
+			hostRequest('http://localhost/api/plugin/session-cost?sessionId=root-1'),
+		),
+		500,
+		'internal-error',
+	);
+	assert.equal(brokenContext.state.warnings.length, 1, 'the internal failure is logged once');
+	assert.match(brokenContext.state.warnings[0], /unhandled host failure/u);
+});
+
+check('host: a composition without a connection seat still registers the projection unit', () => {
+	// No inject seat at all.
+	let { ctx, state } = mockHostContext({ inject: 'none' });
+	assert.doesNotThrow(() => hostApply(ctx));
+	assert.ok(state.unit !== undefined, 'the projection unit registers');
+	assert.equal(state.effects.length, 0, 'no route effect without a connection');
+	// The connection service never becomes available.
+	({ ctx, state } = mockHostContext({ inject: 'deferred' }));
+	assert.doesNotThrow(() => hostApply(ctx));
+	assert.ok(state.unit !== undefined);
+	assert.equal(state.effects.length, 0);
+	// The inject call itself throws: fall back to the direct, missing connection.
+	({ ctx, state } = mockHostContext({ inject: 'throw' }));
+	assert.doesNotThrow(() => hostApply(ctx));
+	assert.ok(state.unit !== undefined);
+	assert.equal(state.effects.length, 0);
+	// A connection without fetch.register is not a route composition either.
+	({ ctx, state } = mockHostContext({ connection: { fetch: {} } }));
+	assert.doesNotThrow(() => hostApply(ctx));
+	assert.ok(state.unit !== undefined);
+	assert.equal(state.effects.length, 0);
+});
+
+/* ==================================================================== */
 /* Part 2 — Client chip and panel                                       */
 /* ==================================================================== */
 
@@ -329,9 +767,15 @@ let stateSeed = null;
 let effectsEnabled = false;
 const cleanups = [];
 
-/** Whether a state value is the balance state (the one carrying `status`). */
+/**
+ * Whether a state value is the component's balance state. v1.2 adds a
+ * `treeCost` state that also carries a `status` field (`{status, value?}`), so
+ * the balance slot is identified by its status vocabulary plus the absence of a
+ * `value` payload; the balance hook is the component's first state slot.
+ */
 function isBalanceState(value) {
-	return value !== null && typeof value === 'object' && typeof value.status === 'string';
+	if (value === null || typeof value !== 'object' || typeof value.status !== 'string') return false;
+	return !('value' in value) && !('truncated' in value);
 }
 
 const react = {
@@ -342,7 +786,9 @@ const react = {
 		slotIndex += 1;
 		if (!(index in slots)) {
 			let value = typeof init === 'function' ? init() : init;
-			if (stateSeed !== null && isBalanceState(value)) {
+			/* The balance state starts at `{status:'loading'}`; the tree state never
+			   uses that status, so the mount seed cannot land on the wrong slot. */
+			if (stateSeed !== null && value !== null && typeof value === 'object' && value.status === 'loading') {
 				value = stateSeed;
 				stateSeed = null;
 			}
@@ -370,6 +816,7 @@ const reactDom = { createPortal: (element) => element };
 const documentListeners = [];
 const styleTags = [];
 const documentStub = {
+	baseURI: 'http://localhost/',
 	body: {},
 	head: {
 		appendChild: (tag) => {
@@ -410,6 +857,24 @@ function clearRecordedInterval(id) {
 	if (entry !== undefined) entry.cleared = true;
 }
 
+/**
+ * Recording `AbortController` stand-in. The client creates one per tree fetch
+ * and aborts it when a newer refresh starts or on unmount; the checks assert
+ * that contract through `instances`.
+ */
+class RecordingAbortController {
+	static instances = [];
+	constructor() {
+		this.signal = { aborted: false };
+		this.aborted = false;
+		RecordingAbortController.instances.push(this);
+	}
+	abort() {
+		this.aborted = true;
+		this.signal.aborted = true;
+	}
+}
+
 const sandbox = {
 	window: {
 		__ModuleLoader__: {
@@ -429,6 +894,8 @@ const sandbox = {
 	document: documentStub,
 	console,
 	Date: fakeDate(Date.now()),
+	URL,
+	AbortController: RecordingAbortController,
 	setInterval: recordInterval,
 	clearInterval: clearRecordedInterval,
 	setTimeout,
@@ -549,9 +1016,17 @@ const ACCOUNT_EXTRA_EN = 'of which other sessions / subagents / tools';
 const ACCOUNT_NOTE_EN = 'The balance is shared by the whole account: other sessions, subagents, other tools, or other devices also draw it down. Account charged only counts balance decreases observed while this page is open (the platform settles in batches, so it can lag briefly); top-ups and grants are not counted.';
 
 /** Component props for one render; `null` selects the absent projection value. */
-function props({ split = SPLIT, usage = USAGE, model = 'deepseek-flash', locale = 'zh', now = OFF_PEAK_NOW } = {}) {
+function props({
+	split = SPLIT,
+	usage = USAGE,
+	model = 'deepseek-flash',
+	locale = 'zh',
+	now = OFF_PEAK_NOW,
+	sessionId = undefined,
+} = {}) {
 	sandbox.Date = fakeDate(now);
 	return {
+		sessionId,
 		useProjection: (key) => {
 			if (key === 'sessionCost') return split ?? undefined;
 			if (key === 'tokenUsage') return usage ?? undefined;
@@ -575,6 +1050,7 @@ function resetMountState() {
 	effectsEnabled = false;
 	for (const cleanup of cleanups.splice(0)) cleanup();
 	intervals.length = 0;
+	RecordingAbortController.instances.length = 0;
 }
 
 /** First mount with a given balance state; later renders keep the component's own state. */
@@ -598,10 +1074,14 @@ function renderWith(component, options) {
 	return component(props(options));
 }
 
-/** The component's live balance state, wherever its hook slot sits. */
+/**
+ * The component's live balance state. v1.2 also keeps a `treeCost` state with a
+ * `status` field, so this keys on the first hook slot, which the component
+ * documents as the balance state.
+ */
 function balanceStateOf() {
-	const state = slots.find((slot) => isBalanceState(slot));
-	assert.ok(state !== undefined, 'the component keeps a balance state slot');
+	const state = slots[0];
+	assert.ok(isBalanceState(state), 'the component keeps the balance state in its first hook slot');
 	return state;
 }
 
@@ -632,6 +1112,18 @@ async function mountLive(options) {
 function fireRefreshTicks(count = 1) {
 	const active = intervals.filter((entry) => entry.cleared === false && entry.ms === 60000);
 	assert.ok(active.length > 0, 'the component registered a 60s balance-refresh interval');
+	for (let index = 0; index < count; index += 1) {
+		for (const entry of active) entry.fn();
+	}
+}
+
+/**
+ * Fire the recorded 20s session-tree refresh interval `count` times without
+ * settling any fetch; used by the tree latest-request-wins test.
+ */
+function fireTreeTicks(count = 1) {
+	const active = intervals.filter((entry) => entry.cleared === false && entry.ms === 20000);
+	assert.ok(active.length > 0, 'the component registered a 20s tree-refresh interval');
 	for (let index = 0; index < count; index += 1) {
 		for (const entry of active) entry.fn();
 	}
@@ -1301,6 +1793,262 @@ await checkAsync('client: a session-spend decrease cannot inflate the other-cons
 		[ACCOUNT_EXTRA_ZH, '-¥3.10'],
 	], 'the decrease is clamped at zero instead of inflating the share');
 	assert.equal(textOf(panel).includes('5.10'), false, 'the inflated -¥5.10 never renders');
+});
+
+/* ---- session tree (v1.2) ---- */
+
+/** One entry split with the empty buckets filled in. */
+const splitView = (peak = {}, off = {}) => ({
+	peak: { ...ZERO_BUCKETS, ...peak },
+	off: { ...ZERO_BUCKETS, ...off },
+});
+
+/** One subagent tree entry. */
+const treeEntry = (id, split, model = 'deepseek-flash', extra = {}) => ({
+	id,
+	parentId: 'root-1',
+	depth: 1,
+	mode: 'subagent',
+	label: id,
+	activity: 'idle',
+	model,
+	split,
+	...extra,
+});
+
+/**
+ * Tree fixture: root ¥1.57 + children ¥2.06 = ¥3.63, every entry on the flash
+ * row. Root: 4.25M peak cache-hit (¥0.17) + 1M off miss (¥1.00) + 100k off
+ * output (¥0.40); children: ¥0.50 + ¥1.00 + ¥0.56.
+ */
+const TREE_VALUE = {
+	root: {
+		id: 'root-1',
+		parentId: null,
+		depth: 0,
+		mode: 'main',
+		label: null,
+		activity: null,
+		model: 'deepseek-flash',
+		split: splitView({ cacheReadTokens: 4_250_000 }, { uncachedInputTokens: 1_000_000, outputTokens: 100_000 }),
+	},
+	children: [
+		treeEntry('billing-auditor', splitView({}, { uncachedInputTokens: 500_000 }), 'deepseek-flash', { label: 'billing-auditor' }),
+		treeEntry('test-author', splitView({ uncachedInputTokens: 500_000 }, {}), 'deepseek-flash', { label: 'test-author' }),
+		treeEntry('verifier', splitView({}, { outputTokens: 140_000 }), 'deepseek-flash', { label: 'verifier' }),
+	],
+	truncated: false,
+};
+
+/** Refreshed tree: root ¥2.00 + the same ¥2.06 of children = ¥4.06. */
+const REFRESHED_TREE_VALUE = {
+	root: { ...TREE_VALUE.root, split: splitView({}, { uncachedInputTokens: 2_000_000 }) },
+	children: TREE_VALUE.children,
+	truncated: false,
+};
+
+/** A stale root-only answer: ¥3.00 and no children, so it is visibly different. */
+const STALE_TREE_VALUE = {
+	root: { ...TREE_VALUE.root, split: splitView({}, { uncachedInputTokens: 3_000_000 }) },
+	children: [],
+	truncated: false,
+};
+
+/** One pro-model child: 1M peak cache-miss at the pro row = ¥9.00, not ¥2.00. */
+const PRO_TREE_VALUE = {
+	root: { ...TREE_VALUE.root, split: splitView() },
+	children: [treeEntry('child-pro', splitView({ uncachedInputTokens: 1_000_000 }), 'deepseek-v4-pro')],
+	truncated: false,
+};
+
+/** A JSON `Response` carrying one tree envelope. */
+const treeResponse = (value, status = 200) => new Response(
+	JSON.stringify({ ok: true, value }),
+	{ status, headers: { 'content-type': 'application/json' } },
+);
+
+/**
+ * Install a tree `fetch` stub into the VM sandbox.
+ * @param handler - receives the 1-based call number; returns a Response or a
+ *   promise for one (deferred tests keep the promise for later resolution).
+ * @returns the recorded call list; the caller must `delete sandbox.fetch`.
+ */
+function stubTreeFetch(handler) {
+	const calls = [];
+	sandbox.fetch = (url, options) => {
+		calls.push({ url: String(url), options });
+		return Promise.resolve(handler(calls.length));
+	};
+	return calls;
+}
+
+await checkAsync('client: a ready session tree sums root and subagent spend (v1.2)', async () => {
+	account.balance = remoteReady([wallet('CNY', '12.34')]);
+	const calls = stubTreeFetch(() => treeResponse(TREE_VALUE));
+	try {
+		await mountLive({ split: ZERO_SPLIT, sessionId: 'root-1' });
+		const tree = render({ split: ZERO_SPLIT, sessionId: 'root-1' });
+		assert.equal(labelOf(tree), '花费 ¥3.63 · 余额 ¥12.34', 'the tree total replaces the root-only total');
+		assert.equal(calls.length, 1, 'one tree fetch on mount');
+		const url = new URL(calls[0].url);
+		assert.equal(url.origin, 'http://localhost', 'the route is same-origin to document.baseURI');
+		assert.equal(url.pathname, '/api/plugin/session-cost');
+		assert.equal(url.searchParams.get('sessionId'), 'root-1');
+		assert.equal(calls[0].options.method, 'GET');
+		assert.equal(calls[0].options.credentials, 'same-origin');
+		chipOf(tree).props.onClick();
+		const parts = partsOf(panelOf(render({ split: ZERO_SPLIT, sessionId: 'root-1' })));
+		assert.deepEqual(parts.top, [
+			['计价模型', 'deepseek-flash'],
+			['计价口径', '按每笔用量发生的时段（高峰 ×2）'],
+			['子代理会话（3 个）', '¥2.06'],
+		], 'the top grid names the subagent share');
+		assert.equal(parts.sections[0].head, '高峰时段（×2）');
+		assert.equal(pairValue(parts.sections[0].rows, '输入 · 缓存未命中'), '500,000 tok ¥1.00');
+		assert.equal(pairValue(parts.sections[0].rows, '输入 · 缓存命中'), '4,250,000 tok ¥0.17');
+		assert.equal(parts.sections[1].head, '空闲时段（×1）');
+		assert.equal(pairValue(parts.sections[1].rows, '输入 · 缓存未命中'), '1,500,000 tok ¥1.50');
+		assert.equal(pairValue(parts.sections[1].rows, '输出'), '240,000 tok ¥0.96');
+	} finally {
+		delete sandbox.fetch;
+	}
+});
+
+await checkAsync('client: subagent entries are priced with their own model row (v1.2)', async () => {
+	account.balance = remoteReady([wallet('CNY', '12.34')]);
+	stubTreeFetch(() => treeResponse(PRO_TREE_VALUE));
+	try {
+		await mountLive({ split: ZERO_SPLIT, sessionId: 'root-1' });
+		const tree = render({ split: ZERO_SPLIT, sessionId: 'root-1' });
+		assert.equal(
+			labelOf(tree),
+			'花费 ¥9.00 · 余额 ¥12.34',
+			'the pro child uses the pro peak row, not the display flash row (¥2.00)',
+		);
+		chipOf(tree).props.onClick();
+		const parts = partsOf(panelOf(render({ split: ZERO_SPLIT, sessionId: 'root-1' })));
+		assert.deepEqual(parts.top[2], ['子代理会话（1 个）', '¥9.00']);
+	} finally {
+		delete sandbox.fetch;
+	}
+});
+
+await checkAsync('client: tree fetch failures fall back to the v1.1 session-only figure (v1.2)', async () => {
+	const rejections = [];
+	const onRejection = (reason) => rejections.push(reason);
+	process.on('unhandledRejection', onRejection);
+	const expectFallback = (label) => {
+		const tree = render({ split: SPLIT, sessionId: 'root-1' });
+		assert.equal(labelOf(tree), '花费 ¥3.00 · 余额 ¥12.34', label);
+		chipOf(tree).props.onClick();
+		const parts = partsOf(panelOf(render({ split: SPLIT, sessionId: 'root-1' })));
+		assert.deepEqual(parts.top.map(([title]) => title), ['计价模型', '计价口径'], 'no subagent row without a tree');
+	};
+	try {
+		// (a) fetch rejects.
+		account.balance = remoteReady([wallet('CNY', '12.34')]);
+		sandbox.fetch = () => Promise.reject(new Error('network down'));
+		await mountLive({ split: SPLIT, sessionId: 'root-1' });
+		expectFallback('a rejected fetch keeps the root-only total');
+		// (b) fetch is absent entirely.
+		delete sandbox.fetch;
+		await mountLive({ split: SPLIT, sessionId: 'root-1' });
+		expectFallback('an absent fetch keeps the root-only total');
+		// (c) an empty session id never fetches.
+		const calls = stubTreeFetch(() => treeResponse(TREE_VALUE));
+		await mountLive({ split: SPLIT, sessionId: '' });
+		assert.equal(calls.length, 0, 'no tree fetch without a session id');
+		expectFallback('an empty session id keeps the root-only total');
+		delete sandbox.fetch;
+		// (d) an unsuccessful or non-envelope response also degrades silently.
+		sandbox.fetch = () => Promise.resolve(new Response('{}', { status: 500 }));
+		await mountLive({ split: SPLIT, sessionId: 'root-1' });
+		expectFallback('an error response keeps the root-only total');
+		sandbox.fetch = () => Promise.resolve(new Response(
+			JSON.stringify({ ok: false, error: { code: 'tree-unavailable' } }),
+			{ status: 200, headers: { 'content-type': 'application/json' } },
+		));
+		await mountLive({ split: SPLIT, sessionId: 'root-1' });
+		expectFallback('a tree-unavailable envelope keeps the root-only total');
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.deepEqual(rejections, [], 'the client never leaves a fetch rejection unhandled');
+	} finally {
+		process.off('unhandledRejection', onRejection);
+		delete sandbox.fetch;
+	}
+});
+
+await checkAsync('client: the tree refreshes on the 20s interval (v1.2)', async () => {
+	account.balance = remoteReady([wallet('CNY', '12.34')]);
+	const payloads = [TREE_VALUE, REFRESHED_TREE_VALUE];
+	const calls = stubTreeFetch((index) => treeResponse(payloads[Math.min(index - 1, payloads.length - 1)]));
+	try {
+		await mountLive({ split: ZERO_SPLIT, sessionId: 'root-1' });
+		let tree = render({ split: ZERO_SPLIT, sessionId: 'root-1' });
+		assert.equal(labelOf(tree), '花费 ¥3.63 · 余额 ¥12.34');
+		assert.equal(calls.length, 1);
+		fireTreeTicks(1);
+		await settleAsync();
+		assert.equal(calls.length, 2, 'the 20s interval refetches the tree');
+		tree = render({ split: ZERO_SPLIT, sessionId: 'root-1' });
+		assert.equal(labelOf(tree), '花费 ¥4.06 · 余额 ¥12.34', 'the refreshed tree wins');
+	} finally {
+		delete sandbox.fetch;
+	}
+});
+
+await checkAsync('client: a superseded tree response does not overwrite a newer one (v1.2)', async () => {
+	account.balance = remoteReady([wallet('CNY', '12.34')]);
+	const pending = [];
+	stubTreeFetch(() => new Promise((resolve) => {
+		pending.push(resolve);
+	}));
+	try {
+		await mountLive({ split: ZERO_SPLIT, sessionId: 'root-1' });
+		assert.equal(pending.length, 1, 'the mount fetch is in flight');
+		pending[0](treeResponse(TREE_VALUE));
+		await settleAsync();
+		chipOf(render({ split: ZERO_SPLIT, sessionId: 'root-1' }))
+			.props.onClick();
+		assert.equal(
+			labelOf(render({ split: ZERO_SPLIT, sessionId: 'root-1' })),
+			'花费 ¥3.63 · 余额 ¥12.34',
+			'baseline tree settled',
+		);
+		fireTreeTicks(2);
+		assert.equal(pending.length, 3, 'two overlapping tree reads are in flight');
+		pending[2](treeResponse(REFRESHED_TREE_VALUE)); // newer answers first: ¥4.06
+		await settleAsync();
+		pending[1](treeResponse(STALE_TREE_VALUE)); // older answers last: ¥3.00, no children
+		await settleAsync();
+		const tree = render({ split: ZERO_SPLIT, sessionId: 'root-1' });
+		assert.equal(labelOf(tree), '花费 ¥4.06 · 余额 ¥12.34', 'the stale tree response is dropped');
+		const parts = partsOf(panelOf(render({ split: ZERO_SPLIT, sessionId: 'root-1' })));
+		assert.deepEqual(parts.top[2], ['子代理会话（3 个）', '¥2.06'], 'the newer tree keeps its subagent row');
+	} finally {
+		delete sandbox.fetch;
+	}
+});
+
+await checkAsync('client: unmount aborts the in-flight tree fetch (v1.2)', async () => {
+	account.balance = remoteReady([wallet('CNY', '12.34')]);
+	const pending = [];
+	stubTreeFetch(() => new Promise((resolve) => {
+		pending.push(resolve);
+	}));
+	try {
+		await mountLive({ split: ZERO_SPLIT, sessionId: 'root-1' });
+		assert.equal(pending.length, 1, 'the mount fetch is in flight');
+		const controller = RecordingAbortController.instances[RecordingAbortController.instances.length - 1];
+		assert.equal(controller.aborted, false, 'the tree request starts unaborted');
+		resetMountState(); // simulate unmount: runs the effect cleanups
+		assert.equal(controller.aborted, true, 'unmount aborts the in-flight request');
+		pending[0](treeResponse(TREE_VALUE));
+		await settleAsync(); // resolving after unmount must be a no-op, not a crash
+		assert.equal(slots.length, 0, 'no component state was mounted again');
+	} finally {
+		delete sandbox.fetch;
+	}
 });
 
 console.log(results.join('\n'));
