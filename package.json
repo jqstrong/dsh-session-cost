@@ -1,9 +1,9 @@
 {
   "name": "@local/dsh-session-cost",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "private": true,
   "type": "module",
-  "description": "Shows this session tree's spend (this session plus its subagent sessions), the account charges observed since the page opened, and the account's remaining balance below the composer.",
+  "description": "Shows this session tree's spend (this session plus its subagent sessions) and the account's remaining balance below the composer, with a per-subagent cost breakdown.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/jqstrong/dsh-session-cost.git"

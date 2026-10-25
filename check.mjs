@@ -11,18 +11,17 @@
  * Part 2 runs the real Client half (`client.js`) in a Node VM with minimal
  * React/react-dom and DOM stubs, driving the chip through its interaction paths
  * (mount, hover, click, Escape) and asserting the chip text, the per-period
- * panel sections, the account-level charge section, the v1.2 session-tree
- * total (with a sandbox `fetch` stub: per-entry model pricing, 20s refresh,
- * latest-wins, unmount abort, silent v1.1 fallback), the v1.2.1 cost-composition
- * breakdown (main session / subagent sessions / one row per child / total,
- * label elision and fallback), and every degraded state — including the
- * regression that the displayed spend must NOT change when the wall clock
- * crosses a rate boundary, the v1.1 regression that a shared account's balance
- * drop is shown next to (not instead of) this session's spend, and the
- * latest-request-wins guard for overlapping balance reads. The 60s
- * balance-refresh and 20s tree-refresh intervals are captured, so a test can
- * fire either tick (or leave several reads in flight with a deferred stub) and
- * settle the async read before asserting.
+ * panel sections, the balance display and its degraded states, the v1.2
+ * session-tree total (with a sandbox `fetch` stub: per-entry model pricing, 20s
+ * refresh, latest-wins, unmount abort, silent v1.1 fallback), and the v1.2.1
+ * cost-composition breakdown (main session / subagent sessions / one row per
+ * child / total, label elision and fallback) — including the regression that
+ * the displayed spend must NOT change when the wall clock crosses a rate
+ * boundary, and the latest-request-wins guard for overlapping balance reads.
+ * The 60s balance-refresh and 20s tree-refresh intervals are captured, so a
+ * test can fire either tick (or leave several reads in flight with a deferred
+ * stub) and settle the async read before asserting. v1.3.0 removed the
+ * account-level charge feature, so no check expects account rows anymore.
  *
  * This is a numbers-and-branch check, NOT visual verification: it never applies
  * CSS and cannot show what the page looks like.
@@ -1002,20 +1001,6 @@ const ONE_YUAN_SPLIT = {
 	off: { ...ZERO_BUCKETS, uncachedInputTokens: 1_000_000 },
 };
 /* `SPLIT` above is the ¥3.00 fixture: 1M cache-miss in each period (¥2 + ¥1). */
-/** Mid-session fixture ¥4.00: peak 1M miss (¥2.00) + off-peak 2M miss (¥2.00). */
-const FOUR_YUAN_SPLIT = {
-	peak: { ...ZERO_BUCKETS, uncachedInputTokens: 1_000_000 },
-	off: { ...ZERO_BUCKETS, uncachedInputTokens: 2_000_000 },
-};
-
-/* Account-section strings from the v1.1 spec; the checks
-   assert these exact user-visible values, not the dictionary internals. */
-const ACCOUNT_HEAD_ZH = '账户已扣（自打开本页）';
-const ACCOUNT_EXTRA_ZH = '其中其他会话 / 子代理 / 工具';
-const ACCOUNT_NOTE_ZH = '余额为整个账户共用：其他会话、子代理、其他工具或设备同样会扣费。账户已扣只统计本页打开后观察到的余额减少（平台按批次结算，可能短暂滞后），充值或赠金变动不计入。它通常小于上面的「本次会话花费」（后者包含本页打开前的花费），两者时间窗不同。';
-const ACCOUNT_HEAD_EN = 'Charged to account (since this page opened)';
-const ACCOUNT_EXTRA_EN = 'of which other sessions / subagents / tools';
-const ACCOUNT_NOTE_EN = 'The balance is shared by the whole account: other sessions, subagents, other tools, or other devices also draw it down. Account charged only counts balance decreases observed while this page is open (the platform settles in batches, so it can lag briefly); top-ups and grants are not counted. It is usually smaller than this session cost above (which includes spend from before the page opened) because the two windows differ.';
 
 /** Component props for one render; `null` selects the absent projection value. */
 function props({
@@ -1180,21 +1165,21 @@ function hasClass(node, className) {
 
 /**
  * Split the panel into its structural parts: the top label/value grid, the
- * v1.2.1 cost-composition block, one block per period section, the
- * account-charge grid with its note, and the balance grid.
+ * v1.2.1 cost-composition block, one block per period section, and the
+ * balance grid.
  * @param panel - the portaled panel element.
- * @returns `{ top, composition, sections, account, balance, notes, order }` —
- *   pair lists, the composition block `{head, rows}` whose rows also carry the
- *   dt metadata used by the elision/fallback checks, the note texts in document
- *   order, and a document-order tag list (`top`, `composition`,
- *   `section:<head>`, `account`, `note`, `balance`).
+ * @returns `{ top, composition, sections, balance, notes, order }` — pair
+ *   lists, the composition block `{head, rows}` whose rows also carry the dt
+ *   metadata used by the elision/fallback checks, the note texts in document
+ *   order (a degraded balance renders one instead of a grid), and a
+ *   document-order tag list (`top`, `composition`, `section:<head>`, `note`,
+ *   `balance`).
  */
 function partsOf(panel) {
 	const top = [];
 	const sections = [];
 	const notes = [];
 	const order = [];
-	let account = null;
 	let balance = null;
 	let composition = null;
 	let current = null;
@@ -1265,12 +1250,7 @@ function partsOf(panel) {
 				return;
 			}
 			const pairs = pairsOf(node);
-			/* The account grid is marked by its class; fall back to its heading
-			   so the parser still finds it if the class is dropped. */
-			if (hasClass(node, 'dshSessionCost_accountRows') || pairs[0]?.[0] === ACCOUNT_HEAD_ZH || pairs[0]?.[0] === ACCOUNT_HEAD_EN) {
-				account = pairs;
-				order.push('account');
-			} else if (phase === 'top') {
+			if (phase === 'top') {
 				top.push(...pairs);
 				order.push('top');
 			} else if (phase === 'section') {
@@ -1284,7 +1264,7 @@ function partsOf(panel) {
 		for (const child of node.children ?? []) visit(child);
 	};
 	visit(panel);
-	return { top, composition, sections, account, balance, notes, order };
+	return { top, composition, sections, balance, notes, order };
 }
 
 const pairValue = (pairs, title) => pairs?.find(([name]) => name === title)?.[1];
@@ -1557,144 +1537,18 @@ await checkAsync('client: apply registers one stylesheet and the disposer remove
 	assert.equal(tag.removed, true, 'disposal removes the stylesheet');
 });
 
-/* ---- account-level charges (v1.1) ---- */
-
-await checkAsync('client: a fresh mount shows no account section', async () => {
-	const tree = mount(READY);
-	assert.equal(labelOf(tree), '花费 ¥3.00 · 余额 ¥12.34', 'the chip keeps its plain form before any read');
-	chipOf(tree).props.onClick();
-	const parts = partsOf(panelOf(render()));
-	assert.equal(parts.account, null, 'no account grid on a fresh mount');
-	assert.deepEqual(parts.notes, [], 'no account note on a fresh mount');
-});
-
-await checkAsync('client: an account drop beyond the session spend adds the segment and rows', async () => {
-	// ¥1.00 of session spend, but the shared account fell ¥3.10: the extra
-	// ¥2.10 is other sessions/subagents/tools, and the chip says so.
-	account.balance = remoteReady([wallet('CNY', '12.34')]);
-	await mountLive({ split: ZERO_SPLIT });
-	let tree = render({ split: ONE_YUAN_SPLIT });
-	assert.equal(labelOf(tree), '花费 ¥1.00 · 余额 ¥12.34', 'the baseline read does not invent a charge');
-	account.balance = remoteReady([wallet('CNY', '9.24')]);
-	tree = await tickRefresh({ split: ONE_YUAN_SPLIT });
-	assert.equal(labelOf(tree), '花费 ¥1.00 · 账户 -¥3.10 · 余额 ¥9.24');
-	chipOf(tree).props.onClick();
-	const parts = partsOf(panelOf(render({ split: ONE_YUAN_SPLIT })));
-	assert.deepEqual(parts.account, [
-		[ACCOUNT_HEAD_ZH, '-¥3.10'],
-		[ACCOUNT_EXTRA_ZH, '-¥2.10'],
-	]);
-	assert.deepEqual(parts.notes, [ACCOUNT_NOTE_ZH], 'the shared-account note explains the difference');
-});
-
-await checkAsync('client: a drop equal to the session spend adds no extra row', async () => {
-	// SPLIT is ¥3.00 of session spend and the account falls exactly ¥3.00:
-	// there is no other-session share to surface.
-	account.balance = remoteReady([wallet('CNY', '12.34')]);
-	await mountLive({ split: ZERO_SPLIT });
-	account.balance = remoteReady([wallet('CNY', '9.34')]);
-	const tree = await tickRefresh({ split: SPLIT });
-	assert.equal(labelOf(tree), '花费 ¥3.00 · 余额 ¥9.34', 'no account segment when the drop matches the spend');
-	chipOf(tree).props.onClick();
-	const parts = partsOf(panelOf(render({ split: SPLIT })));
-	assert.deepEqual(parts.account, [[ACCOUNT_HEAD_ZH, '-¥3.00']], 'only the account row is shown');
-});
-
-await checkAsync('client: a top-up is not counted as negative spend', async () => {
-	account.balance = remoteReady([wallet('CNY', '12.34')]);
-	await mountLive({ split: ZERO_SPLIT });
-	account.balance = remoteReady([wallet('CNY', '20.00')]);
-	let tree = await tickRefresh({ split: ONE_YUAN_SPLIT });
-	assert.equal(labelOf(tree), '花费 ¥1.00 · 余额 ¥20.00', 'an increased balance is absorbed, never subtracted');
-	account.balance = remoteReady([wallet('CNY', '19.00')]);
-	tree = await tickRefresh({ split: ONE_YUAN_SPLIT });
-	assert.equal(labelOf(tree), '花费 ¥1.00 · 余额 ¥19.00');
-	chipOf(tree).props.onClick();
-	const parts = partsOf(panelOf(render({ split: ONE_YUAN_SPLIT })));
-	assert.deepEqual(parts.account, [[ACCOUNT_HEAD_ZH, '-¥1.00']], 'only the real drop after the top-up counts');
-});
-
-await checkAsync('client: a failed read resets the baseline instead of billing the outage', async () => {
-	account.balance = remoteReady([wallet('CNY', '12.34')]);
-	await mountLive({ split: ZERO_SPLIT });
-	account.balance = { ok: false };
-	let tree = await tickRefresh({ split: ONE_YUAN_SPLIT });
-	assert.equal(labelOf(tree), '花费 ¥1.00 · 余额不可用', 'the failure degrades the chip');
-	account.balance = remoteReady([wallet('CNY', '8.00')]);
-	tree = await tickRefresh({ split: ONE_YUAN_SPLIT });
-	assert.equal(labelOf(tree), '花费 ¥1.00 · 余额 ¥8.00', 'the next success re-baselines');
-	chipOf(tree).props.onClick();
-	const panel = panelOf(render({ split: ONE_YUAN_SPLIT }));
-	const parts = partsOf(panel);
-	assert.equal(parts.account, null, 'the outage gap is not claimed as a charge');
-	assert.equal(textOf(panel).includes('4.34'), false, 'the ¥12.34 → ¥8.00 gap never surfaces');
-});
-
-await checkAsync('client: account charges accumulate separately per currency', async () => {
-	account.balance = remoteReady([wallet('CNY', '10.00'), wallet('USD', '5.00')]);
-	await mountLive({ split: ZERO_SPLIT });
-	account.balance = remoteReady([wallet('CNY', '6.90'), wallet('USD', '3.00')]);
-	const tree = await tickRefresh({ split: ONE_YUAN_SPLIT });
-	chipOf(tree).props.onClick();
-	const parts = partsOf(panelOf(render({ split: ONE_YUAN_SPLIT })));
-	assert.deepEqual(parts.account, [
-		[ACCOUNT_HEAD_ZH, '-¥3.10 + -$2.00'],
-		[ACCOUNT_EXTRA_ZH, '-¥2.10'],
-	]);
-});
-
-await checkAsync('client: english locale renders the account chip segment', async () => {
-	account.balance = remoteReady([wallet('CNY', '12.34')]);
-	await mountLive({ split: ZERO_SPLIT, locale: 'en' });
-	account.balance = remoteReady([wallet('CNY', '9.24')]);
-	const tree = await tickRefresh({ split: ONE_YUAN_SPLIT, locale: 'en' });
-	assert.equal(labelOf(tree), 'Spent ¥1.00 · account -¥3.10 · balance ¥9.24');
-});
-
-await checkAsync('client: english locale localises the account section', async () => {
-	account.balance = remoteReady([wallet('CNY', '12.34')]);
-	await mountLive({ split: ZERO_SPLIT, locale: 'en' });
-	account.balance = remoteReady([wallet('CNY', '9.24')]);
-	const tree = await tickRefresh({ split: ONE_YUAN_SPLIT, locale: 'en' });
-	chipOf(tree).props.onClick();
-	const parts = partsOf(panelOf(render({ split: ONE_YUAN_SPLIT, locale: 'en' })));
-	assert.deepEqual(parts.account, [
-		[ACCOUNT_HEAD_EN, '-¥3.10'],
-		[ACCOUNT_EXTRA_EN, '-¥2.10'],
-	]);
-	assert.deepEqual(parts.notes, [ACCOUNT_NOTE_EN]);
-});
-
-await checkAsync('client: the account segment waits for a ready balance', async () => {
-	account.balance = remoteReady([wallet('CNY', '12.34')]);
-	await mountLive({ split: ZERO_SPLIT });
-	account.balance = remoteReady([wallet('CNY', '9.24')]);
-	await tickRefresh({ split: ONE_YUAN_SPLIT });
-	account.balance = { ok: false };
-	const tree = await tickRefresh({ split: ONE_YUAN_SPLIT });
-	assert.equal(labelOf(tree), '花费 ¥1.00 · 余额不可用', 'the degraded chip omits the account segment');
-	chipOf(tree).props.onClick();
-	const parts = partsOf(panelOf(render({ split: ONE_YUAN_SPLIT })));
-	assert.deepEqual(parts.account, [
-		[ACCOUNT_HEAD_ZH, '-¥3.10'],
-		[ACCOUNT_EXTRA_ZH, '-¥2.10'],
-	], 'the accumulated charge stays visible in the panel');
-});
-
-/* ---- overlapping reads, signed-out reset, and panel order (verifier D1/D5) ---- */
-
 await checkAsync('client: overlapping balance reads keep the latest response (D1)', async () => {
 	// The account stub is deferred so the test controls resolution order. The
-	// mount read settles first (the baseline), then two interval ticks are left
-	// in flight and the OLDER request answers LAST. Without latest-request-wins
-	// the stale 12.34 would revert the chip and corrupt the charge baseline.
+	// mount read settles first, then two interval ticks are left in flight and
+	// the OLDER request answers LAST. Without latest-request-wins the stale
+	// 12.34 would revert the displayed balance.
 	const pending = [];
 	const immediateGetBalance = account.getBalance;
 	account.getBalance = () => new Promise((resolve) => {
 		pending.push(resolve);
 	});
 	try {
-		await mountLive({ split: ZERO_SPLIT });
+		await mountLive({ split: ONE_YUAN_SPLIT });
 		assert.equal(pending.length, 1, 'the mount issued one balance read');
 		pending[0](remoteReady([wallet('CNY', '12.34')]));
 		await settleAsync();
@@ -1708,28 +1562,25 @@ await checkAsync('client: overlapping balance reads keep the latest response (D1
 		const tree = render({ split: ONE_YUAN_SPLIT });
 		assert.equal(
 			labelOf(tree),
-			'花费 ¥1.00 · 账户 -¥4.34 · 余额 ¥8.00',
-			'the true ¥4.34 drop is shown, not the stale ¥12.34 balance',
+			'花费 ¥1.00 · 余额 ¥8.00',
+			'the newer ¥8.00 balance wins over the stale ¥12.34 response',
 		);
 		chipOf(tree).props.onClick();
 		const parts = partsOf(panelOf(render({ split: ONE_YUAN_SPLIT })));
-		assert.deepEqual(parts.account, [
-			[ACCOUNT_HEAD_ZH, '-¥4.34'],
-			[ACCOUNT_EXTRA_ZH, '-¥3.34'],
-		], 'the accumulated charge reflects only the newer response');
+		assert.equal(pairValue(parts.balance, '可用合计'), '¥8.00', 'the panel balance matches the chip');
 	} finally {
 		account.getBalance = immediateGetBalance;
 	}
 });
 
-await checkAsync('client: a stale response after a top-up neither reverts the chip nor invents a charge (D1)', async () => {
+await checkAsync('client: a stale balance response never reverts the chip (D1)', async () => {
 	const pending = [];
 	const immediateGetBalance = account.getBalance;
 	account.getBalance = () => new Promise((resolve) => {
 		pending.push(resolve);
 	});
 	try {
-		await mountLive({ split: ZERO_SPLIT });
+		await mountLive({ split: ONE_YUAN_SPLIT });
 		pending[0](remoteReady([wallet('CNY', '12.34')]));
 		await settleAsync();
 		fireRefreshTicks(2);
@@ -1739,93 +1590,39 @@ await checkAsync('client: a stale response after a top-up neither reverts the ch
 		await settleAsync();
 		let tree = render({ split: ONE_YUAN_SPLIT });
 		assert.equal(labelOf(tree), '花费 ¥1.00 · 余额 ¥20.00', 'the stale snapshot does not revert the balance');
-		// The next real read must baseline on 20.00, proving the stale response
-		// never entered the accumulator (it would otherwise turn ¥1.00 into a
-		// spurious multi-unit charge or swallow the real drawdown).
+		// A following real read paints normally on top of the newer snapshot.
 		account.getBalance = immediateGetBalance;
 		account.balance = remoteReady([wallet('CNY', '19.00')]);
 		tree = await tickRefresh({ split: ONE_YUAN_SPLIT });
-		assert.equal(labelOf(tree), '花费 ¥1.00 · 余额 ¥19.00', 'only the real ¥1.00 drawdown is measured');
-		chipOf(tree).props.onClick();
-		const parts = partsOf(panelOf(render({ split: ONE_YUAN_SPLIT })));
-		assert.deepEqual(parts.account, [[ACCOUNT_HEAD_ZH, '-¥1.00']], 'the stale response invented no charge');
+		assert.equal(labelOf(tree), '花费 ¥1.00 · 余额 ¥19.00', 'the next read replaces the balance normally');
 	} finally {
 		account.getBalance = immediateGetBalance;
 	}
 });
 
-await checkAsync('client: a signed-out read resets the baseline (D5)', async () => {
+await checkAsync('client: a signed-out read degrades then recovers (D5)', async () => {
 	account.balance = remoteReady([wallet('CNY', '12.34')]);
-	await mountLive({ split: ZERO_SPLIT });
+	await mountLive({ split: ONE_YUAN_SPLIT });
 	account.balance = { ok: true, value: null }; // signed out
 	let tree = await tickRefresh({ split: ONE_YUAN_SPLIT });
 	assert.equal(labelOf(tree), '花费 ¥1.00 · 未登录账号', 'the signed-out read degrades the chip');
 	account.balance = remoteReady([wallet('CNY', '8.00')]);
 	tree = await tickRefresh({ split: ONE_YUAN_SPLIT });
-	assert.equal(labelOf(tree), '花费 ¥1.00 · 余额 ¥8.00', 'the next ready read re-baselines');
-	chipOf(tree).props.onClick();
-	const parts = partsOf(panelOf(render({ split: ONE_YUAN_SPLIT })));
-	assert.equal(parts.account, null, 'no charge is claimed across the signed-out gap');
+	assert.equal(labelOf(tree), '花费 ¥1.00 · 余额 ¥8.00', 'the next ready read paints the balance again');
 });
 
-await checkAsync('client: the account section keeps its place between periods and balance (D5)', async () => {
+await checkAsync('client: the balance grid closes the panel after the period sections (v1.3.0)', async () => {
 	account.balance = remoteReady([wallet('CNY', '12.34')]);
-	await mountLive({ split: ZERO_SPLIT });
-	account.balance = remoteReady([wallet('CNY', '9.34')]);
-	const tree = await tickRefresh({ split: SPLIT });
+	await mountLive({ split: SPLIT });
+	const tree = render({ split: SPLIT });
 	chipOf(tree).props.onClick();
 	const parts = partsOf(panelOf(render({ split: SPLIT })));
 	assert.deepEqual(parts.order, [
 		'top',
 		'section:高峰时段（×2）',
 		'section:空闲时段（×1）',
-		'account',
-		'note',
 		'balance',
-	], 'the account grid and note render after the period sections and before the balance grid');
-});
-
-/* ---- mid-session rebase of the other-consumer share ---- */
-
-await checkAsync('client: the other-consumer share rebases to spend since the page opened', async () => {
-	// The page opens mid-session with ¥3.00 already spent; the session then grows
-	// to ¥4.00 while the shared account falls ¥3.10. Only the ¥1.00 spent since
-	// the page opened can be this session's own, so the other-consumer share is
-	// ¥2.10 — not the whole ¥3.10 (that would overstate other consumers and hide
-	// the ¥1.00 this session spent while the page was open).
-	account.balance = remoteReady([wallet('CNY', '12.34')]);
-	await mountLive({ split: SPLIT });
-	let tree = render({ split: SPLIT });
-	assert.equal(labelOf(tree), '花费 ¥3.00 · 余额 ¥12.34', 'the mid-session baseline paints');
-	account.balance = remoteReady([wallet('CNY', '9.24')]);
-	tree = await tickRefresh({ split: FOUR_YUAN_SPLIT });
-	assert.equal(labelOf(tree), '花费 ¥4.00 · 账户 -¥3.10 · 余额 ¥9.24');
-	chipOf(tree).props.onClick();
-	const parts = partsOf(panelOf(render({ split: FOUR_YUAN_SPLIT })));
-	assert.deepEqual(parts.account, [
-		[ACCOUNT_HEAD_ZH, '-¥3.10'],
-		[ACCOUNT_EXTRA_ZH, '-¥2.10'],
-	], 'the ¥2.10 share excludes the ¥3.00 already spent when the page opened');
-});
-
-await checkAsync('client: a session-spend decrease cannot inflate the other-consumer row', async () => {
-	// The page opens at ¥3.00 spent, then the projection drops to ¥1.00 while the
-	// account falls ¥3.10. Without the lower clamp the since-open figure would be
-	// -¥2.00 and the row would inflate to -¥5.10; it must stay clamped at the
-	// observed -¥3.10 (a negative session delta must never become extra share).
-	account.balance = remoteReady([wallet('CNY', '12.34')]);
-	await mountLive({ split: SPLIT });
-	account.balance = remoteReady([wallet('CNY', '9.24')]);
-	const tree = await tickRefresh({ split: ONE_YUAN_SPLIT });
-	assert.equal(labelOf(tree), '花费 ¥1.00 · 账户 -¥3.10 · 余额 ¥9.24');
-	chipOf(tree).props.onClick();
-	const panel = panelOf(render({ split: ONE_YUAN_SPLIT }));
-	const parts = partsOf(panel);
-	assert.deepEqual(parts.account, [
-		[ACCOUNT_HEAD_ZH, '-¥3.10'],
-		[ACCOUNT_EXTRA_ZH, '-¥3.10'],
-	], 'the decrease is clamped at zero instead of inflating the share');
-	assert.equal(textOf(panel).includes('5.10'), false, 'the inflated -¥5.10 never renders');
+	], 'top grid -> period sections -> balance grid, with no account section');
 });
 
 /* ---- session tree (v1.2) ---- */
@@ -2260,10 +2057,8 @@ await checkAsync('client: the composition section keeps its place in the panel (
 			'composition',
 			'section:高峰时段（×2）',
 			'section:空闲时段（×1）',
-			'account',
-			'note',
 			'balance',
-		], 'top grid -> composition -> period sections -> account -> balance');
+		], 'top grid -> composition -> period sections -> balance grid');
 	} finally {
 		delete sandbox.fetch;
 	}

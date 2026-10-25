@@ -23,17 +23,13 @@
  * - Remaining balance: `ctx.remote.account.getBalance`, the same Host Remote
  *   the Settings → Account page reads. A failed or signed-out read degrades to
  *   the spend figure alone; it never removes the chip.
- * - Account-wide charges: every ready balance read is compared with the
- *   previous one and the total decrease per currency is accumulated. The
- *   balance belongs to the whole account — other DSH sessions, subagents,
- *   other tools using the same account, or another device all draw it down —
- *   so this total is what reconciles the chip with the balance drop, while the
- *   spend figure above stays strictly this session's token cost.
  * - Session tree: agent-team teammates and subagents run in their own durable
  *   Sessions (headers carry `parentSession`), so the conversation's real cost
  *   is the sum over the tree. The Host half serves that sum over one
  *   same-origin GET route (`host/tree.js`); when it is unavailable (older
  *   Host, missing query service) the chip falls back to this session alone.
+ *   The panel decomposes the sum into the main session plus one row per
+ *   subagent session.
  *
  * No Harness Client package is imported: React and react-dom come from the
  * page's module table, the icons are inline SVG, and every style reads theme
@@ -50,7 +46,7 @@ window.__ModuleLoader__.load({
 		/** Locale namespace whose dictionaries carry every visible string. */
 		const NS = 'session-cost';
 		/** Identity the account Remote carries for this UI. */
-		const CLIENT_VERSION = '1.2.1';
+		const CLIENT_VERSION = '1.3.0';
 		/** Currency assumed when the account reports no wallet. */
 		const DEFAULT_CURRENCY = 'CNY';
 		/** Balance re-read cadence, and the shortest gap between two reads. */
@@ -60,12 +56,6 @@ window.__ModuleLoader__.load({
 		const TREE_REFRESH_MS = 20000;
 		/** Longest subagent label rendered in the cost breakdown before eliding. */
 		const CHILD_LABEL_MAX = 18;
-		/**
-		 * Smallest account-wide excess over this session's own spend worth
-		 * surfacing separately. Below it the difference is noise (rounding,
-		 * requests still in flight), so the chip keeps its simple form.
-		 */
-		const ACCOUNT_EXTRA_MIN = 0.01;
 		/** Hover opens the panel after this dwell; leaving closes it after this grace period. */
 		const HOVER_OPEN_MS = 260;
 		const HOVER_CLOSE_MS = 200;
@@ -121,7 +111,6 @@ window.__ModuleLoader__.load({
 
 		const zh = {
 			chip: '花费 {spend} · 余额 {balance}',
-			chipAccount: '花费 {spend} · 账户 {account} · 余额 {balance}',
 			chipNoBalance: '花费 {spend} · 余额不可用',
 			chipLoading: '花费 {spend} · 余额读取中…',
 			chipSignedOut: '花费 {spend} · 未登录账号',
@@ -143,14 +132,11 @@ window.__ModuleLoader__.load({
 			rowWrite: '输入 · 缓存写入',
 			rowOut: '输出',
 			rowSubtotal: '小计',
-			rowAccount: '账户已扣（自打开本页）',
-			rowAccountExtra: '其中其他会话 / 子代理 / 工具',
 			rowSubagents: '子代理会话（{count} 个）',
 			sectionComposition: '费用构成',
 			rowMainSession: '主会话',
 			rowTotal: '合计',
 			childFallback: '子代理会话',
-			accountNote: '余额为整个账户共用：其他会话、子代理、其他工具或设备同样会扣费。账户已扣只统计本页打开后观察到的余额减少（平台按批次结算，可能短暂滞后），充值或赠金变动不计入。它通常小于上面的「本次会话花费」（后者包含本页打开前的花费），两者时间窗不同。',
 			rowTopUp: '充值余额',
 			rowBonus: '赠金余额',
 			rowAvailable: '可用合计',
@@ -163,7 +149,6 @@ window.__ModuleLoader__.load({
 
 		const en = {
 			chip: 'Spent {spend} · Balance {balance}',
-			chipAccount: 'Spent {spend} · account {account} · balance {balance}',
 			chipNoBalance: 'Spent {spend} · Balance unavailable',
 			chipLoading: 'Spent {spend} · reading balance…',
 			chipSignedOut: 'Spent {spend} · not signed in',
@@ -185,14 +170,11 @@ window.__ModuleLoader__.load({
 			rowWrite: 'Input · cache write',
 			rowOut: 'Output',
 			rowSubtotal: 'Subtotal',
-			rowAccount: 'Charged to account (since this page opened)',
-			rowAccountExtra: 'of which other sessions / subagents / tools',
 			rowSubagents: 'Subagent sessions ({count})',
 			sectionComposition: 'Cost breakdown',
 			rowMainSession: 'Main session',
 			rowTotal: 'Total',
 			childFallback: 'Subagent session',
-			accountNote: 'The balance is shared by the whole account: other sessions, subagents, other tools, or other devices also draw it down. Account charged only counts balance decreases observed while this page is open (the platform settles in batches, so it can lag briefly); top-ups and grants are not counted. It is usually smaller than this session cost above (which includes spend from before the page opened) because the two windows differ.',
 			rowTopUp: 'Topped up',
 			rowBonus: 'Granted',
 			rowAvailable: 'Available',
@@ -491,62 +473,6 @@ window.__ModuleLoader__.load({
 			return [...rows.values()].map((row) => ({ ...row, total: row.topUp + row.granted }));
 		}
 
-		/**
-		 * Spendable balance per currency, for change detection.
-		 * @param balance - the resolved balance state.
-		 * @returns `{ [currency]: total }`, or null when no ready balance exists.
-		 */
-		function totalsByCurrency(balance) {
-			if (balance === null || balance === undefined || balance.status !== 'ready') return null;
-			const totals = {};
-			for (const row of availableTotals(balance)) totals[row.currency] = row.total;
-			return totals;
-		}
-
-		/**
-		 * Fold one observed balance into the account-charge accumulator.
-		 *
-		 * Only decreases count as spending; an increase means a top-up or a
-		 * granted bonus, so it is absorbed into the new baseline instead of
-		 * lowering the spend. A non-ready read clears the baseline, so a gap in
-		 * observation (failure, sign-out) never turns into a charge. The client
-		 * drops stale overlapping reads (latest request wins), so this fold only
-		 * sees observations in issue order; it is pure and chains the previous
-		 * snapshot it received, which keeps the accumulated deltas exact.
-		 *
-		 * The first ready read also records how much this session had already
-		 * spent at that instant: the account deltas only cover the time since the
-		 * page opened, so the session's lifetime spend must be rebased to the same
-		 * instant before the two are compared (otherwise opening the page
-		 * mid-session would hide the other-consumer share).
-		 * @param state - `{ previous, spent, sessionSpendAtOpen }` accumulator state.
-		 * @param balance - the balance state just read.
-		 * @param sessionSpend - the session's lifetime spend at read time.
-		 * @returns the next accumulator state.
-		 */
-		function nextAccountCharge(state, balance, sessionSpend) {
-			const current = totalsByCurrency(balance);
-			if (current === null) {
-				return { previous: null, spent: state.spent, sessionSpendAtOpen: state.sessionSpendAtOpen };
-			}
-			if (state.previous === null) {
-				const opened = state.sessionSpendAtOpen ?? (Number.isFinite(sessionSpend) ? sessionSpend : 0);
-				return { previous: current, spent: state.spent, sessionSpendAtOpen: opened };
-			}
-			const spent = { ...state.spent };
-			let changed = false;
-			for (const currency of Object.keys(current)) {
-				const before = state.previous[currency];
-				if (before === undefined) continue;
-				const delta = before - current[currency];
-				if (Number.isFinite(delta) && delta > 0) {
-					spent[currency] = (spent[currency] ?? 0) + delta;
-					changed = true;
-				}
-			}
-			return { previous: current, spent: changed ? spent : state.spent, sessionSpendAtOpen: state.sessionSpendAtOpen };
-		}
-
 		/** Local fallback translator, used only when the locale seat is absent. */
 		function fallbackTranslate(key, params) {
 			const template = zh[key] ?? key;
@@ -666,8 +592,6 @@ window.__ModuleLoader__.load({
 				const usage = useProjection('tokenUsage');
 				const selection = useProjection('modelSelection');
 				const [balance, setBalance] = React.useState({ status: 'loading' });
-				/** Account-wide deductions observed since mount: `{ previous, spent, sessionSpendAtOpen }`. */
-				const [accountCharge, setAccountCharge] = React.useState({ previous: null, spent: {}, sessionSpendAtOpen: null });
 				/** Host-computed session tree (this session + its subagent sessions). */
 				const [treeCost, setTreeCost] = React.useState({ status: 'idle' });
 				const [pinned, setPinned] = React.useState(false);
@@ -680,8 +604,6 @@ window.__ModuleLoader__.load({
 				const treeSeq = React.useRef(0);
 				/** In-flight tree request, aborted when a newer one starts or on unmount. */
 				const treeAbort = React.useRef(null);
-				/** Latest session spend, read by the charge fold when a read settles. */
-				const sessionSpend = React.useRef(0);
 				const timers = React.useRef([]);
 				const open = pinned || hovered;
 				const { anchorRef, panelRef, pos } = useAnchoredPanel(open);
@@ -699,10 +621,9 @@ window.__ModuleLoader__.load({
 					readBalance().then(
 						(next) => {
 							/* Latest request wins: a slow earlier read must not overwrite a
-							   newer snapshot (nor corrupt the charge baseline). */
+							   newer balance snapshot. */
 							if (!alive.current || seq !== readSeq.current) return;
 							setBalance(next);
-							setAccountCharge((state) => nextAccountCharge(state, next, sessionSpend.current));
 						},
 						() => {},
 					);
@@ -891,32 +812,13 @@ window.__ModuleLoader__.load({
 				}
 				const resolved = resolveSpend({ split: displaySplit, totals, currency, model, now });
 				const sessionTotal = treeSpend ?? resolved.total;
-				/* Keep the fold's notion of "session spend now" current for the next read. */
-				sessionSpend.current = sessionTotal;
 				const spendText = `${treeSpend === null && resolved.estimated ? '≈' : ''}${money(sessionTotal, currency)}`;
 				const balanceText = available.length > 0
 					? available.map((row) => balanceMoney(row.total, row.currency)).join(' + ')
 					: null;
-				/* Account-wide charges observed since this page opened, and the part
-				   of them that cannot be this session's own spend. Rebase the
-				   session's lifetime spend to the first observed balance so both
-				   figures cover the same window (the page may open mid-session). */
-				const sessionSpendAtOpen = accountCharge.sessionSpendAtOpen ?? 0;
-				const sessionSpendSinceOpen = Math.max(0, sessionTotal - sessionSpendAtOpen);
-				const charged = Object.entries(accountCharge.spent)
-					.filter(([, amount]) => Number.isFinite(amount) && amount > 1e-9);
-				const chargeText = charged
-					.map(([chargedCurrency, amount]) => `-${money(amount, chargedCurrency)}`)
-					.join(' + ');
-				const extraCharge = Math.max(0, (accountCharge.spent[currency] ?? 0) - sessionSpendSinceOpen);
-				const showExtraCharge = extraCharge > ACCOUNT_EXTRA_MIN;
 
 				let label;
-				if (balanceText !== null) {
-					label = charged.length > 0 && showExtraCharge
-						? tr('chipAccount', { spend: spendText, account: chargeText, balance: balanceText })
-						: tr('chip', { spend: spendText, balance: balanceText });
-				}
+				if (balanceText !== null) label = tr('chip', { spend: spendText, balance: balanceText });
 				else if (balance.status === 'loading') label = tr('chipLoading', { spend: spendText });
 				else if (balance.status === 'signed-out') label = tr('chipSignedOut', { spend: spendText });
 				else label = tr('chipNoBalance', { spend: spendText });
@@ -1010,21 +912,6 @@ window.__ModuleLoader__.load({
 					];
 				}
 
-				/* Account-wide deductions reconcile the chip with the account balance:
-				   the balance is shared, so a drop can exceed this session's spend. */
-				let accountSection = null;
-				if (charged.length > 0) {
-					const accountRows = [gridRow('account', tr('rowAccount'), chargeText)];
-					if (showExtraCharge) {
-						accountRows.push(gridRow('account-extra', tr('rowAccountExtra'), `-${money(extraCharge, currency)}`));
-					}
-					accountSection = [
-						h('div', { key: 'account-rule', className: 'dshSessionCost_panelSection', 'aria-hidden': true }),
-						h('dl', { key: 'account-list', className: 'dshSessionCost_details dshSessionCost_accountRows' }, accountRows.flat()),
-						h('div', { key: 'account-note', className: 'dshSessionCost_note' }, tr('accountNote')),
-					];
-				}
-
 				let balanceSection;
 				if (balance.status === 'ready' && available.length > 0) {
 					const rows = [];
@@ -1079,7 +966,6 @@ window.__ModuleLoader__.load({
 						h('div', { className: 'dshSessionCost_sectionHead' }, tr(section.titleKey, section.titleParams)),
 						h('dl', { className: 'dshSessionCost_details' }, sectionRows(section).flat()),
 					)),
-					accountSection,
 					balanceSection,
 					h('div', { className: 'dshSessionCost_footer' }, h('span', null, tr('footer'))),
 				);
