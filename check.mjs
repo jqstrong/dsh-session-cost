@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Logic check for the `@local/dsh-session-cost` bundle.
  *
  * Part 1 drives the real Host half (`index.js`) against a mock projection
@@ -9,8 +9,14 @@
  * Part 2 runs the real Client half (`client.js`) in a Node VM with minimal
  * React/react-dom and DOM stubs, driving the chip through its interaction paths
  * (mount, hover, click, Escape) and asserting the chip text, the per-period
- * panel sections, and every degraded state — including the regression that the
- * displayed spend must NOT change when the wall clock crosses a rate boundary.
+ * panel sections, the account-level charge section, and every degraded state —
+ * including the regression that the displayed spend must NOT change when the
+ * wall clock crosses a rate boundary, the v1.1 regression that a shared
+ * account's balance drop is shown next to (not instead of) this session's
+ * spend, and the latest-request-wins guard for overlapping balance reads. The
+ * 60s balance-refresh interval is captured, so a test can fire the tick (or
+ * leave several reads in flight with a deferred stub) and settle the async read
+ * before asserting.
  *
  * This is a numbers-and-branch check, NOT visual verification: it never applies
  * CSS and cannot show what the page looks like.
@@ -306,9 +312,27 @@ function fakeDate(nowMs) {
 }
 
 let slotIndex = 0;
+/**
+ * Component state slots, one entry per `useState` call of the mounted instance.
+ * Read them through the shape-based helpers below, not by fixed index: v1.1
+ * inserts the account-charge state next to the balance state.
+ */
 const slots = [];
+/**
+ * First-mount override for the component's balance state. `mount()` needs to
+ * start a render with the balance already settled because the real read is
+ * asynchronous; the mock consumes this seed at the first `useState` whose
+ * initial value looks like a balance state — keyed on shape, not slot order, so
+ * adding account-charge state above the balance does not break the checks.
+ */
+let stateSeed = null;
 let effectsEnabled = false;
 const cleanups = [];
+
+/** Whether a state value is the balance state (the one carrying `status`). */
+function isBalanceState(value) {
+	return value !== null && typeof value === 'object' && typeof value.status === 'string';
+}
 
 const react = {
 	Fragment: Symbol('Fragment'),
@@ -316,7 +340,14 @@ const react = {
 	useState: (init) => {
 		const index = slotIndex;
 		slotIndex += 1;
-		if (!(index in slots)) slots[index] = typeof init === 'function' ? init() : init;
+		if (!(index in slots)) {
+			let value = typeof init === 'function' ? init() : init;
+			if (stateSeed !== null && isBalanceState(value)) {
+				value = stateSeed;
+				stateSeed = null;
+			}
+			slots[index] = value;
+		}
 		return [slots[index], (next) => {
 			slots[index] = typeof next === 'function' ? next(slots[index]) : next;
 		}];
@@ -364,6 +395,21 @@ const documentStub = {
 };
 
 let registration;
+
+/** Recorded `setInterval` registrations, so a test can fire the balance poll. */
+let nextIntervalId = 0;
+const intervals = [];
+function recordInterval(fn, ms) {
+	const id = nextIntervalId;
+	nextIntervalId += 1;
+	intervals.push({ id, fn, ms, cleared: false });
+	return id;
+}
+function clearRecordedInterval(id) {
+	const entry = intervals.find((item) => item.id === id);
+	if (entry !== undefined) entry.cleared = true;
+}
+
 const sandbox = {
 	window: {
 		__ModuleLoader__: {
@@ -371,8 +417,8 @@ const sandbox = {
 				registration = value;
 			},
 		},
-		setInterval: () => 0,
-		clearInterval: () => {},
+		setInterval: recordInterval,
+		clearInterval: clearRecordedInterval,
 		setTimeout: (fn, ms) => setTimeout(fn, ms),
 		clearTimeout: (id) => clearTimeout(id),
 		addEventListener: () => {},
@@ -383,8 +429,8 @@ const sandbox = {
 	document: documentStub,
 	console,
 	Date: fakeDate(Date.now()),
-	setInterval: () => 0,
-	clearInterval: () => {},
+	setInterval: recordInterval,
+	clearInterval: clearRecordedInterval,
 	setTimeout,
 	clearTimeout,
 };
@@ -467,6 +513,41 @@ const SPLIT = {
 };
 const READY = { status: 'ready', wallets: [{ currency: 'CNY', balance: '12.34' }], bonusWallets: [] };
 
+/** A raw `remote.account.getBalance` result the mutable stub can serve. */
+const remoteReady = (wallets, bonusWallets = []) => ({
+	ok: true,
+	value: { status: 'ready', value: wallets, bonusWallets },
+});
+const wallet = (currency, balance) => ({ currency, balance });
+
+/** Empty token buckets. */
+const ZERO_BUCKETS = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 };
+/** Session spend ¥0.00: the page opened before this session spent anything. */
+const ZERO_SPLIT = {
+	peak: { ...ZERO_BUCKETS },
+	off: { ...ZERO_BUCKETS },
+};
+/** Session-spend fixture: 1M off-peak cache-miss tokens = exactly ¥1.00. */
+const ONE_YUAN_SPLIT = {
+	peak: { ...ZERO_BUCKETS },
+	off: { ...ZERO_BUCKETS, uncachedInputTokens: 1_000_000 },
+};
+/* `SPLIT` above is the ¥3.00 fixture: 1M cache-miss in each period (¥2 + ¥1). */
+/** Mid-session fixture ¥4.00: peak 1M miss (¥2.00) + off-peak 2M miss (¥2.00). */
+const FOUR_YUAN_SPLIT = {
+	peak: { ...ZERO_BUCKETS, uncachedInputTokens: 1_000_000 },
+	off: { ...ZERO_BUCKETS, uncachedInputTokens: 2_000_000 },
+};
+
+/* Account-section strings from the v1.1 spec; the checks
+   assert these exact user-visible values, not the dictionary internals. */
+const ACCOUNT_HEAD_ZH = '账户已扣（自打开本页）';
+const ACCOUNT_EXTRA_ZH = '其中其他会话 / 子代理 / 工具';
+const ACCOUNT_NOTE_ZH = '余额为整个账户共用：其他会话、子代理、其他工具或设备同样会扣费。账户已扣只统计本页打开后观察到的余额减少（平台按批次结算，可能短暂滞后），充值或赠金变动不计入。';
+const ACCOUNT_HEAD_EN = 'Charged to account (since this page opened)';
+const ACCOUNT_EXTRA_EN = 'of which other sessions / subagents / tools';
+const ACCOUNT_NOTE_EN = 'The balance is shared by the whole account: other sessions, subagents, other tools, or other devices also draw it down. Account charged only counts balance decreases observed while this page is open (the platform settles in batches, so it can lag briefly); top-ups and grants are not counted.';
+
 /** Component props for one render; `null` selects the absent projection value. */
 function props({ split = SPLIT, usage = USAGE, model = 'deepseek-flash', locale = 'zh', now = OFF_PEAK_NOW } = {}) {
 	sandbox.Date = fakeDate(now);
@@ -483,12 +564,26 @@ function props({ split = SPLIT, usage = USAGE, model = 'deepseek-flash', locale 
 	};
 }
 
-/** First mount with a given balance state; later renders keep the component's own state. */
-function mount(balanceState, options) {
+/**
+ * Start a fresh component instance: empty state slots, no pending effects, and
+ * no recorded interval left over from a previous test.
+ */
+function resetMountState() {
 	slots.length = 0;
 	slotIndex = 0;
-	slots[0] = balanceState;
-	return render(options);
+	stateSeed = null;
+	effectsEnabled = false;
+	for (const cleanup of cleanups.splice(0)) cleanup();
+	intervals.length = 0;
+}
+
+/** First mount with a given balance state; later renders keep the component's own state. */
+function mount(balanceState, options) {
+	resetMountState();
+	stateSeed = balanceState;
+	const tree = render(options);
+	stateSeed = null;
+	return tree;
 }
 
 /** Re-render the same component instance. */
@@ -501,6 +596,56 @@ function render(options) {
 function renderWith(component, options) {
 	slotIndex = 0;
 	return component(props(options));
+}
+
+/** The component's live balance state, wherever its hook slot sits. */
+function balanceStateOf() {
+	const state = slots.find((slot) => isBalanceState(slot));
+	assert.ok(state !== undefined, 'the component keeps a balance state slot');
+	return state;
+}
+
+/** Flush the async read behind one refresh tick (two macrotask turns). */
+function settleAsync() {
+	return new Promise((resolve) => setTimeout(resolve, 0))
+		.then(() => new Promise((resolve) => setTimeout(resolve, 0)));
+}
+
+/**
+ * Mount with effects enabled, so the mount balance read runs and the 60s
+ * refresh interval is registered; then settle the read. Re-render to paint it.
+ */
+async function mountLive(options) {
+	resetMountState();
+	effectsEnabled = true;
+	const tree = render(options);
+	effectsEnabled = false;
+	await settleAsync();
+	return tree;
+}
+
+/**
+ * Fire the recorded 60s balance-refresh interval `count` times without settling
+ * any read; used by the latest-request-wins tests to leave overlapping reads in
+ * flight.
+ */
+function fireRefreshTicks(count = 1) {
+	const active = intervals.filter((entry) => entry.cleared === false && entry.ms === 60000);
+	assert.ok(active.length > 0, 'the component registered a 60s balance-refresh interval');
+	for (let index = 0; index < count; index += 1) {
+		for (const entry of active) entry.fn();
+	}
+}
+
+/**
+ * Fire the recorded 60s balance-refresh interval, settle the async read, and
+ * re-render the same component instance.
+ * @returns the tree after the tick settled.
+ */
+async function tickRefresh(options) {
+	fireRefreshTicks(1);
+	await settleAsync();
+	return render(options);
 }
 
 /** Concatenate an element subtree's text. */
@@ -533,47 +678,88 @@ const chipOf = (tree) => find(tree, (node) => node.props?.className === 'dshSess
 const labelOf = (tree) => textOf(find(tree, (node) => node.props?.className === 'dshSessionCost_label'));
 const panelOf = (tree) => find(tree, (node) => node.props?.role === 'dialog');
 
+/** Whether a node's class list contains one given class. */
+function hasClass(node, className) {
+	const classes = typeof node.props?.className === 'string' ? node.props.className.split(/\s+/u) : [];
+	return classes.includes(className);
+}
+
 /**
  * Split the panel into its structural parts: the top label/value grid, one
- * block per period section, and the balance grid.
+ * block per period section, the account-charge grid with its note, and the
+ * balance grid.
  * @param panel - the portaled panel element.
- * @returns `{ top, sections, balance }`, each a pair list or a headed section list.
+ * @returns `{ top, sections, account, balance, notes, order }` — pair lists, a
+ *   headed section list, the note texts in document order, and a document-order
+ *   tag list (`top`, `section:<head>`, `account`, `note`, `balance`) used to
+ *   assert the v1.1 layout order. The account note is the one that follows the
+ *   account grid; degraded balances render their own note instead of a grid.
  */
 function partsOf(panel) {
 	const top = [];
 	const sections = [];
+	const notes = [];
+	const order = [];
+	let account = null;
 	let balance = null;
 	let current = null;
+	/** Which grid comes next: the top grid, a period section, or a panel block. */
+	let phase = 'top';
+	const pairsOf = (node) => {
+		const pairs = [];
+		let title = null;
+		for (const child of (node.children ?? []).flat()) {
+			if (child === null || typeof child !== 'object') continue;
+			if (child.type === 'dt') title = textOf(child);
+			if (child.type === 'dd') pairs.push([title, textOf(child)]);
+		}
+		return pairs;
+	};
 	const visit = (node) => {
 		if (node === null || node === undefined || typeof node !== 'object') return;
 		if (Array.isArray(node)) {
 			for (const child of node) visit(child);
 			return;
 		}
-		if (node.props?.className === 'dshSessionCost_sectionHead') {
+		if (hasClass(node, 'dshSessionCost_sectionHead')) {
 			current = { head: textOf(node), rows: [] };
 			sections.push(current);
+			order.push(`section:${current.head}`);
+			phase = 'section';
 			return;
 		}
-		if (node.props?.className === 'dshSessionCost_panelSection') {
+		if (hasClass(node, 'dshSessionCost_note')) {
+			notes.push(textOf(node));
+			order.push('note');
+			return;
+		}
+		if (hasClass(node, 'dshSessionCost_panelSection')) {
 			current = null;
-			balance = [];
+			phase = 'panel';
 			return;
 		}
 		if (node.type === 'dl') {
-			const target = balance ?? (current === null ? top : current.rows);
-			let title = null;
-			for (const child of (node.children ?? []).flat()) {
-				if (child === null || typeof child !== 'object') continue;
-				if (child.type === 'dt') title = textOf(child);
-				if (child.type === 'dd') target.push([title, textOf(child)]);
+			const pairs = pairsOf(node);
+			/* The account grid is marked by its class; fall back to its heading
+			   so the parser still finds it if the class is dropped. */
+			if (hasClass(node, 'dshSessionCost_accountRows') || pairs[0]?.[0] === ACCOUNT_HEAD_ZH || pairs[0]?.[0] === ACCOUNT_HEAD_EN) {
+				account = pairs;
+				order.push('account');
+			} else if (phase === 'top') {
+				top.push(...pairs);
+				order.push('top');
+			} else if (phase === 'section') {
+				current.rows.push(...pairs);
+			} else {
+				balance = pairs;
+				order.push('balance');
 			}
 			return;
 		}
 		for (const child of node.children ?? []) visit(child);
 	};
 	visit(panel);
-	return { top, sections, balance };
+	return { top, sections, account, balance, notes, order };
 }
 
 const pairValue = (pairs, title) => pairs?.find(([name]) => name === title)?.[1];
@@ -811,7 +997,7 @@ await checkAsync('client: a missing account namespace degrades instead of throwi
 	effectsEnabled = false;
 	assert.equal(labelOf(tree), '花费 ≈¥1.60 · 余额读取中…', 'mount state before the read settles');
 	await new Promise((resolve) => setTimeout(resolve, 0));
-	assert.equal(slots[0].status, 'unavailable');
+	assert.equal(balanceStateOf().status, 'unavailable');
 	assert.equal(labelOf(renderWith(local.component, { split: null })), '花费 ≈¥1.60 · 余额不可用');
 });
 
@@ -827,7 +1013,7 @@ await checkAsync('client: mount issues exactly one balance read and paints the s
 	assert.equal(labelOf(first), '花费 ¥3.00 · 余额读取中…');
 	assert.equal(cleanups.length > 0, true, 'the mount effect registered a cleanup');
 	await new Promise((resolve) => setTimeout(resolve, 0));
-	assert.equal(slots[0].status, 'ready');
+	assert.equal(balanceStateOf().status, 'ready');
 	assert.equal(labelOf(renderWith(captured.component)), '花费 ¥3.00 · 余额 ¥7.50');
 	effectsEnabled = false;
 	for (const cleanup of cleanups.splice(0)) cleanup();
@@ -844,6 +1030,277 @@ await checkAsync('client: apply registers one stylesheet and the disposer remove
 	assert.equal(matches.length > 0, true, 'the stylesheet effect registered a disposer');
 	matches[matches.length - 1].cleanup();
 	assert.equal(tag.removed, true, 'disposal removes the stylesheet');
+});
+
+/* ---- account-level charges (v1.1) ---- */
+
+await checkAsync('client: a fresh mount shows no account section', async () => {
+	const tree = mount(READY);
+	assert.equal(labelOf(tree), '花费 ¥3.00 · 余额 ¥12.34', 'the chip keeps its plain form before any read');
+	chipOf(tree).props.onClick();
+	const parts = partsOf(panelOf(render()));
+	assert.equal(parts.account, null, 'no account grid on a fresh mount');
+	assert.deepEqual(parts.notes, [], 'no account note on a fresh mount');
+});
+
+await checkAsync('client: an account drop beyond the session spend adds the segment and rows', async () => {
+	// ¥1.00 of session spend, but the shared account fell ¥3.10: the extra
+	// ¥2.10 is other sessions/subagents/tools, and the chip says so.
+	account.balance = remoteReady([wallet('CNY', '12.34')]);
+	await mountLive({ split: ZERO_SPLIT });
+	let tree = render({ split: ONE_YUAN_SPLIT });
+	assert.equal(labelOf(tree), '花费 ¥1.00 · 余额 ¥12.34', 'the baseline read does not invent a charge');
+	account.balance = remoteReady([wallet('CNY', '9.24')]);
+	tree = await tickRefresh({ split: ONE_YUAN_SPLIT });
+	assert.equal(labelOf(tree), '花费 ¥1.00 · 账户 -¥3.10 · 余额 ¥9.24');
+	chipOf(tree).props.onClick();
+	const parts = partsOf(panelOf(render({ split: ONE_YUAN_SPLIT })));
+	assert.deepEqual(parts.account, [
+		[ACCOUNT_HEAD_ZH, '-¥3.10'],
+		[ACCOUNT_EXTRA_ZH, '-¥2.10'],
+	]);
+	assert.deepEqual(parts.notes, [ACCOUNT_NOTE_ZH], 'the shared-account note explains the difference');
+});
+
+await checkAsync('client: a drop equal to the session spend adds no extra row', async () => {
+	// SPLIT is ¥3.00 of session spend and the account falls exactly ¥3.00:
+	// there is no other-session share to surface.
+	account.balance = remoteReady([wallet('CNY', '12.34')]);
+	await mountLive({ split: ZERO_SPLIT });
+	account.balance = remoteReady([wallet('CNY', '9.34')]);
+	const tree = await tickRefresh({ split: SPLIT });
+	assert.equal(labelOf(tree), '花费 ¥3.00 · 余额 ¥9.34', 'no account segment when the drop matches the spend');
+	chipOf(tree).props.onClick();
+	const parts = partsOf(panelOf(render({ split: SPLIT })));
+	assert.deepEqual(parts.account, [[ACCOUNT_HEAD_ZH, '-¥3.00']], 'only the account row is shown');
+});
+
+await checkAsync('client: a top-up is not counted as negative spend', async () => {
+	account.balance = remoteReady([wallet('CNY', '12.34')]);
+	await mountLive({ split: ZERO_SPLIT });
+	account.balance = remoteReady([wallet('CNY', '20.00')]);
+	let tree = await tickRefresh({ split: ONE_YUAN_SPLIT });
+	assert.equal(labelOf(tree), '花费 ¥1.00 · 余额 ¥20.00', 'an increased balance is absorbed, never subtracted');
+	account.balance = remoteReady([wallet('CNY', '19.00')]);
+	tree = await tickRefresh({ split: ONE_YUAN_SPLIT });
+	assert.equal(labelOf(tree), '花费 ¥1.00 · 余额 ¥19.00');
+	chipOf(tree).props.onClick();
+	const parts = partsOf(panelOf(render({ split: ONE_YUAN_SPLIT })));
+	assert.deepEqual(parts.account, [[ACCOUNT_HEAD_ZH, '-¥1.00']], 'only the real drop after the top-up counts');
+});
+
+await checkAsync('client: a failed read resets the baseline instead of billing the outage', async () => {
+	account.balance = remoteReady([wallet('CNY', '12.34')]);
+	await mountLive({ split: ZERO_SPLIT });
+	account.balance = { ok: false };
+	let tree = await tickRefresh({ split: ONE_YUAN_SPLIT });
+	assert.equal(labelOf(tree), '花费 ¥1.00 · 余额不可用', 'the failure degrades the chip');
+	account.balance = remoteReady([wallet('CNY', '8.00')]);
+	tree = await tickRefresh({ split: ONE_YUAN_SPLIT });
+	assert.equal(labelOf(tree), '花费 ¥1.00 · 余额 ¥8.00', 'the next success re-baselines');
+	chipOf(tree).props.onClick();
+	const panel = panelOf(render({ split: ONE_YUAN_SPLIT }));
+	const parts = partsOf(panel);
+	assert.equal(parts.account, null, 'the outage gap is not claimed as a charge');
+	assert.equal(textOf(panel).includes('4.34'), false, 'the ¥12.34 → ¥8.00 gap never surfaces');
+});
+
+await checkAsync('client: account charges accumulate separately per currency', async () => {
+	account.balance = remoteReady([wallet('CNY', '10.00'), wallet('USD', '5.00')]);
+	await mountLive({ split: ZERO_SPLIT });
+	account.balance = remoteReady([wallet('CNY', '6.90'), wallet('USD', '3.00')]);
+	const tree = await tickRefresh({ split: ONE_YUAN_SPLIT });
+	chipOf(tree).props.onClick();
+	const parts = partsOf(panelOf(render({ split: ONE_YUAN_SPLIT })));
+	assert.deepEqual(parts.account, [
+		[ACCOUNT_HEAD_ZH, '-¥3.10 + -$2.00'],
+		[ACCOUNT_EXTRA_ZH, '-¥2.10'],
+	]);
+});
+
+await checkAsync('client: english locale renders the account chip segment', async () => {
+	account.balance = remoteReady([wallet('CNY', '12.34')]);
+	await mountLive({ split: ZERO_SPLIT, locale: 'en' });
+	account.balance = remoteReady([wallet('CNY', '9.24')]);
+	const tree = await tickRefresh({ split: ONE_YUAN_SPLIT, locale: 'en' });
+	assert.equal(labelOf(tree), 'Spent ¥1.00 · account -¥3.10 · balance ¥9.24');
+});
+
+await checkAsync('client: english locale localises the account section', async () => {
+	account.balance = remoteReady([wallet('CNY', '12.34')]);
+	await mountLive({ split: ZERO_SPLIT, locale: 'en' });
+	account.balance = remoteReady([wallet('CNY', '9.24')]);
+	const tree = await tickRefresh({ split: ONE_YUAN_SPLIT, locale: 'en' });
+	chipOf(tree).props.onClick();
+	const parts = partsOf(panelOf(render({ split: ONE_YUAN_SPLIT, locale: 'en' })));
+	assert.deepEqual(parts.account, [
+		[ACCOUNT_HEAD_EN, '-¥3.10'],
+		[ACCOUNT_EXTRA_EN, '-¥2.10'],
+	]);
+	assert.deepEqual(parts.notes, [ACCOUNT_NOTE_EN]);
+});
+
+await checkAsync('client: the account segment waits for a ready balance', async () => {
+	account.balance = remoteReady([wallet('CNY', '12.34')]);
+	await mountLive({ split: ZERO_SPLIT });
+	account.balance = remoteReady([wallet('CNY', '9.24')]);
+	await tickRefresh({ split: ONE_YUAN_SPLIT });
+	account.balance = { ok: false };
+	const tree = await tickRefresh({ split: ONE_YUAN_SPLIT });
+	assert.equal(labelOf(tree), '花费 ¥1.00 · 余额不可用', 'the degraded chip omits the account segment');
+	chipOf(tree).props.onClick();
+	const parts = partsOf(panelOf(render({ split: ONE_YUAN_SPLIT })));
+	assert.deepEqual(parts.account, [
+		[ACCOUNT_HEAD_ZH, '-¥3.10'],
+		[ACCOUNT_EXTRA_ZH, '-¥2.10'],
+	], 'the accumulated charge stays visible in the panel');
+});
+
+/* ---- overlapping reads, signed-out reset, and panel order (verifier D1/D5) ---- */
+
+await checkAsync('client: overlapping balance reads keep the latest response (D1)', async () => {
+	// The account stub is deferred so the test controls resolution order. The
+	// mount read settles first (the baseline), then two interval ticks are left
+	// in flight and the OLDER request answers LAST. Without latest-request-wins
+	// the stale 12.34 would revert the chip and corrupt the charge baseline.
+	const pending = [];
+	const immediateGetBalance = account.getBalance;
+	account.getBalance = () => new Promise((resolve) => {
+		pending.push(resolve);
+	});
+	try {
+		await mountLive({ split: ZERO_SPLIT });
+		assert.equal(pending.length, 1, 'the mount issued one balance read');
+		pending[0](remoteReady([wallet('CNY', '12.34')]));
+		await settleAsync();
+		assert.equal(labelOf(render({ split: ONE_YUAN_SPLIT })), '花费 ¥1.00 · 余额 ¥12.34', 'the baseline settled');
+		fireRefreshTicks(2);
+		assert.equal(pending.length, 3, 'two overlapping reads are in flight');
+		pending[2](remoteReady([wallet('CNY', '8.00')])); // newer read answers first
+		await settleAsync();
+		pending[1](remoteReady([wallet('CNY', '12.34')])); // older read answers last
+		await settleAsync();
+		const tree = render({ split: ONE_YUAN_SPLIT });
+		assert.equal(
+			labelOf(tree),
+			'花费 ¥1.00 · 账户 -¥4.34 · 余额 ¥8.00',
+			'the true ¥4.34 drop is shown, not the stale ¥12.34 balance',
+		);
+		chipOf(tree).props.onClick();
+		const parts = partsOf(panelOf(render({ split: ONE_YUAN_SPLIT })));
+		assert.deepEqual(parts.account, [
+			[ACCOUNT_HEAD_ZH, '-¥4.34'],
+			[ACCOUNT_EXTRA_ZH, '-¥3.34'],
+		], 'the accumulated charge reflects only the newer response');
+	} finally {
+		account.getBalance = immediateGetBalance;
+	}
+});
+
+await checkAsync('client: a stale response after a top-up neither reverts the chip nor invents a charge (D1)', async () => {
+	const pending = [];
+	const immediateGetBalance = account.getBalance;
+	account.getBalance = () => new Promise((resolve) => {
+		pending.push(resolve);
+	});
+	try {
+		await mountLive({ split: ZERO_SPLIT });
+		pending[0](remoteReady([wallet('CNY', '12.34')]));
+		await settleAsync();
+		fireRefreshTicks(2);
+		pending[2](remoteReady([wallet('CNY', '20.00')])); // the top-up is the newer read
+		await settleAsync();
+		pending[1](remoteReady([wallet('CNY', '12.34')])); // stale pre-top-up snapshot answers last
+		await settleAsync();
+		let tree = render({ split: ONE_YUAN_SPLIT });
+		assert.equal(labelOf(tree), '花费 ¥1.00 · 余额 ¥20.00', 'the stale snapshot does not revert the balance');
+		// The next real read must baseline on 20.00, proving the stale response
+		// never entered the accumulator (it would otherwise turn ¥1.00 into a
+		// spurious multi-unit charge or swallow the real drawdown).
+		account.getBalance = immediateGetBalance;
+		account.balance = remoteReady([wallet('CNY', '19.00')]);
+		tree = await tickRefresh({ split: ONE_YUAN_SPLIT });
+		assert.equal(labelOf(tree), '花费 ¥1.00 · 余额 ¥19.00', 'only the real ¥1.00 drawdown is measured');
+		chipOf(tree).props.onClick();
+		const parts = partsOf(panelOf(render({ split: ONE_YUAN_SPLIT })));
+		assert.deepEqual(parts.account, [[ACCOUNT_HEAD_ZH, '-¥1.00']], 'the stale response invented no charge');
+	} finally {
+		account.getBalance = immediateGetBalance;
+	}
+});
+
+await checkAsync('client: a signed-out read resets the baseline (D5)', async () => {
+	account.balance = remoteReady([wallet('CNY', '12.34')]);
+	await mountLive({ split: ZERO_SPLIT });
+	account.balance = { ok: true, value: null }; // signed out
+	let tree = await tickRefresh({ split: ONE_YUAN_SPLIT });
+	assert.equal(labelOf(tree), '花费 ¥1.00 · 未登录账号', 'the signed-out read degrades the chip');
+	account.balance = remoteReady([wallet('CNY', '8.00')]);
+	tree = await tickRefresh({ split: ONE_YUAN_SPLIT });
+	assert.equal(labelOf(tree), '花费 ¥1.00 · 余额 ¥8.00', 'the next ready read re-baselines');
+	chipOf(tree).props.onClick();
+	const parts = partsOf(panelOf(render({ split: ONE_YUAN_SPLIT })));
+	assert.equal(parts.account, null, 'no charge is claimed across the signed-out gap');
+});
+
+await checkAsync('client: the account section keeps its place between periods and balance (D5)', async () => {
+	account.balance = remoteReady([wallet('CNY', '12.34')]);
+	await mountLive({ split: ZERO_SPLIT });
+	account.balance = remoteReady([wallet('CNY', '9.34')]);
+	const tree = await tickRefresh({ split: SPLIT });
+	chipOf(tree).props.onClick();
+	const parts = partsOf(panelOf(render({ split: SPLIT })));
+	assert.deepEqual(parts.order, [
+		'top',
+		'section:高峰时段（×2）',
+		'section:空闲时段（×1）',
+		'account',
+		'note',
+		'balance',
+	], 'the account grid and note render after the period sections and before the balance grid');
+});
+
+/* ---- mid-session rebase of the other-consumer share ---- */
+
+await checkAsync('client: the other-consumer share rebases to spend since the page opened', async () => {
+	// The page opens mid-session with ¥3.00 already spent; the session then grows
+	// to ¥4.00 while the shared account falls ¥3.10. Only the ¥1.00 spent since
+	// the page opened can be this session's own, so the other-consumer share is
+	// ¥2.10 — not the whole ¥3.10 (that would overstate other consumers and hide
+	// the ¥1.00 this session spent while the page was open).
+	account.balance = remoteReady([wallet('CNY', '12.34')]);
+	await mountLive({ split: SPLIT });
+	let tree = render({ split: SPLIT });
+	assert.equal(labelOf(tree), '花费 ¥3.00 · 余额 ¥12.34', 'the mid-session baseline paints');
+	account.balance = remoteReady([wallet('CNY', '9.24')]);
+	tree = await tickRefresh({ split: FOUR_YUAN_SPLIT });
+	assert.equal(labelOf(tree), '花费 ¥4.00 · 账户 -¥3.10 · 余额 ¥9.24');
+	chipOf(tree).props.onClick();
+	const parts = partsOf(panelOf(render({ split: FOUR_YUAN_SPLIT })));
+	assert.deepEqual(parts.account, [
+		[ACCOUNT_HEAD_ZH, '-¥3.10'],
+		[ACCOUNT_EXTRA_ZH, '-¥2.10'],
+	], 'the ¥2.10 share excludes the ¥3.00 already spent when the page opened');
+});
+
+await checkAsync('client: a session-spend decrease cannot inflate the other-consumer row', async () => {
+	// The page opens at ¥3.00 spent, then the projection drops to ¥1.00 while the
+	// account falls ¥3.10. Without the lower clamp the since-open figure would be
+	// -¥2.00 and the row would inflate to -¥5.10; it must stay clamped at the
+	// observed -¥3.10 (a negative session delta must never become extra share).
+	account.balance = remoteReady([wallet('CNY', '12.34')]);
+	await mountLive({ split: SPLIT });
+	account.balance = remoteReady([wallet('CNY', '9.24')]);
+	const tree = await tickRefresh({ split: ONE_YUAN_SPLIT });
+	assert.equal(labelOf(tree), '花费 ¥1.00 · 账户 -¥3.10 · 余额 ¥9.24');
+	chipOf(tree).props.onClick();
+	const panel = panelOf(render({ split: ONE_YUAN_SPLIT }));
+	const parts = partsOf(panel);
+	assert.deepEqual(parts.account, [
+		[ACCOUNT_HEAD_ZH, '-¥3.10'],
+		[ACCOUNT_EXTRA_ZH, '-¥3.10'],
+	], 'the decrease is clamped at zero instead of inflating the share');
+	assert.equal(textOf(panel).includes('5.10'), false, 'the inflated -¥5.10 never renders');
 });
 
 console.log(results.join('\n'));
