@@ -12,15 +12,17 @@
  * React/react-dom and DOM stubs, driving the chip through its interaction paths
  * (mount, hover, click, Escape) and asserting the chip text, the per-period
  * panel sections, the account-level charge section, the v1.2 session-tree
- * total/subagent row (with a sandbox `fetch` stub: per-entry model pricing,
- * 20s refresh, latest-wins, unmount abort, silent v1.1 fallback), and every
- * degraded state — including the regression that the displayed spend must NOT
- * change when the wall clock crosses a rate boundary, the v1.1 regression that
- * a shared account's balance drop is shown next to (not instead of) this
- * session's spend, and the latest-request-wins guard for overlapping balance
- * reads. The 60s balance-refresh and 20s tree-refresh intervals are captured,
- * so a test can fire either tick (or leave several reads in flight with a
- * deferred stub) and settle the async read before asserting.
+ * total (with a sandbox `fetch` stub: per-entry model pricing, 20s refresh,
+ * latest-wins, unmount abort, silent v1.1 fallback), the v1.2.1 cost-composition
+ * breakdown (main session / subagent sessions / one row per child / total,
+ * label elision and fallback), and every degraded state — including the
+ * regression that the displayed spend must NOT change when the wall clock
+ * crosses a rate boundary, the v1.1 regression that a shared account's balance
+ * drop is shown next to (not instead of) this session's spend, and the
+ * latest-request-wins guard for overlapping balance reads. The 60s
+ * balance-refresh and 20s tree-refresh intervals are captured, so a test can
+ * fire either tick (or leave several reads in flight with a deferred stub) and
+ * settle the async read before asserting.
  *
  * This is a numbers-and-branch check, NOT visual verification: it never applies
  * CSS and cannot show what the page looks like.
@@ -1010,10 +1012,10 @@ const FOUR_YUAN_SPLIT = {
    assert these exact user-visible values, not the dictionary internals. */
 const ACCOUNT_HEAD_ZH = '账户已扣（自打开本页）';
 const ACCOUNT_EXTRA_ZH = '其中其他会话 / 子代理 / 工具';
-const ACCOUNT_NOTE_ZH = '余额为整个账户共用：其他会话、子代理、其他工具或设备同样会扣费。账户已扣只统计本页打开后观察到的余额减少（平台按批次结算，可能短暂滞后），充值或赠金变动不计入。';
+const ACCOUNT_NOTE_ZH = '余额为整个账户共用：其他会话、子代理、其他工具或设备同样会扣费。账户已扣只统计本页打开后观察到的余额减少（平台按批次结算，可能短暂滞后），充值或赠金变动不计入。它通常小于上面的「本次会话花费」（后者包含本页打开前的花费），两者时间窗不同。';
 const ACCOUNT_HEAD_EN = 'Charged to account (since this page opened)';
 const ACCOUNT_EXTRA_EN = 'of which other sessions / subagents / tools';
-const ACCOUNT_NOTE_EN = 'The balance is shared by the whole account: other sessions, subagents, other tools, or other devices also draw it down. Account charged only counts balance decreases observed while this page is open (the platform settles in batches, so it can lag briefly); top-ups and grants are not counted.';
+const ACCOUNT_NOTE_EN = 'The balance is shared by the whole account: other sessions, subagents, other tools, or other devices also draw it down. Account charged only counts balance decreases observed while this page is open (the platform settles in batches, so it can lag briefly); top-ups and grants are not counted. It is usually smaller than this session cost above (which includes spend from before the page opened) because the two windows differ.';
 
 /** Component props for one render; `null` selects the absent projection value. */
 function props({
@@ -1177,15 +1179,15 @@ function hasClass(node, className) {
 }
 
 /**
- * Split the panel into its structural parts: the top label/value grid, one
- * block per period section, the account-charge grid with its note, and the
- * balance grid.
+ * Split the panel into its structural parts: the top label/value grid, the
+ * v1.2.1 cost-composition block, one block per period section, the
+ * account-charge grid with its note, and the balance grid.
  * @param panel - the portaled panel element.
- * @returns `{ top, sections, account, balance, notes, order }` — pair lists, a
- *   headed section list, the note texts in document order, and a document-order
- *   tag list (`top`, `section:<head>`, `account`, `note`, `balance`) used to
- *   assert the v1.1 layout order. The account note is the one that follows the
- *   account grid; degraded balances render their own note instead of a grid.
+ * @returns `{ top, composition, sections, account, balance, notes, order }` —
+ *   pair lists, the composition block `{head, rows}` whose rows also carry the
+ *   dt metadata used by the elision/fallback checks, the note texts in document
+ *   order, and a document-order tag list (`top`, `composition`,
+ *   `section:<head>`, `account`, `note`, `balance`).
  */
 function partsOf(panel) {
 	const top = [];
@@ -1194,6 +1196,7 @@ function partsOf(panel) {
 	const order = [];
 	let account = null;
 	let balance = null;
+	let composition = null;
 	let current = null;
 	/** Which grid comes next: the top grid, a period section, or a panel block. */
 	let phase = 'top';
@@ -1206,6 +1209,26 @@ function partsOf(panel) {
 			if (child.type === 'dd') pairs.push([title, textOf(child)]);
 		}
 		return pairs;
+	};
+	/** One composition row: the label text plus the dt/dd metadata it renders. */
+	const compositionRowsOf = (node) => {
+		const rows = [];
+		let open = null;
+		for (const child of (node.children ?? []).flat()) {
+			if (child === null || typeof child !== 'object') continue;
+			if (child.type === 'dt') {
+				open = {
+					label: textOf(child),
+					title: child.props?.title,
+					labelClass: child.props?.className,
+				};
+			}
+			if (child.type === 'dd' && open !== null) {
+				rows.push({ ...open, value: textOf(child), valueClass: child.props?.className });
+				open = null;
+			}
+		}
+		return rows;
 	};
 	const visit = (node) => {
 		if (node === null || node === undefined || typeof node !== 'object') return;
@@ -1231,6 +1254,16 @@ function partsOf(panel) {
 			return;
 		}
 		if (node.type === 'dl') {
+			/* The composition section is a normal section head followed by its
+			   marked grid, so move the just-pushed head out of `sections`. */
+			if (hasClass(node, 'dshSessionCost_compositionRows')) {
+				const head = sections.pop();
+				composition = { head: head === undefined ? '' : head.head, rows: compositionRowsOf(node) };
+				order.pop();
+				order.push('composition');
+				phase = 'panel';
+				return;
+			}
 			const pairs = pairsOf(node);
 			/* The account grid is marked by its class; fall back to its heading
 			   so the parser still finds it if the class is dropped. */
@@ -1251,7 +1284,7 @@ function partsOf(panel) {
 		for (const child of node.children ?? []) visit(child);
 	};
 	visit(panel);
-	return { top, sections, account, balance, notes, order };
+	return { top, composition, sections, account, balance, notes, order };
 }
 
 const pairValue = (pairs, title) => pairs?.find(([name]) => name === title)?.[1];
@@ -1861,6 +1894,35 @@ const PRO_TREE_VALUE = {
 	truncated: false,
 };
 
+/** A tree with no subagent sessions: the composition section must disappear. */
+const ROOT_ONLY_TREE_VALUE = {
+	root: TREE_VALUE.root,
+	children: [],
+	truncated: false,
+};
+
+/** A long child label (elided at 18 chars) and a child with no label (id fallback). */
+const LONG_LABEL_TREE_VALUE = {
+	root: { ...TREE_VALUE.root, split: splitView() },
+	children: [
+		treeEntry('child-long', splitView({}, { uncachedInputTokens: 500_000 }), 'deepseek-flash', {
+			label: 'billing-auditor-with-a-very-long-label',
+		}),
+		treeEntry('abcdef123456', splitView({}, { uncachedInputTokens: 500_000 }), 'deepseek-flash', { label: null }),
+	],
+	truncated: false,
+};
+
+/** Two flash children totalling ¥3.00 for the English composition labels. */
+const EN_TREE_VALUE = {
+	root: { ...TREE_VALUE.root, split: splitView() },
+	children: [
+		treeEntry('child-a', splitView({}, { uncachedInputTokens: 1_000_000 }), 'deepseek-flash', { label: 'billing-auditor' }),
+		treeEntry('child-b', splitView({}, { uncachedInputTokens: 2_000_000 }), 'deepseek-flash', { label: 'verifier' }),
+	],
+	truncated: false,
+};
+
 /** A JSON `Response` carrying one tree envelope. */
 const treeResponse = (value, status = 200) => new Response(
 	JSON.stringify({ ok: true, value }),
@@ -1901,8 +1963,19 @@ await checkAsync('client: a ready session tree sums root and subagent spend (v1.
 		assert.deepEqual(parts.top, [
 			['计价模型', 'deepseek-flash'],
 			['计价口径', '按每笔用量发生的时段（高峰 ×2）'],
+		], 'the top grid no longer repeats the subagent share');
+		assert.equal(parts.composition.head, '费用构成');
+		assert.deepEqual(parts.composition.rows.map(({ label, value }) => [label, value]), [
+			['主会话', '¥1.57'],
 			['子代理会话（3 个）', '¥2.06'],
-		], 'the top grid names the subagent share');
+			['· billing-auditor', '¥0.5000'],
+			['· test-author', '¥1.00'],
+			['· verifier', '¥0.5600'],
+			['合计', '¥3.63'],
+		], 'the composition section decomposes the tree total');
+		assert.equal(parts.composition.rows[2].labelClass, 'dshSessionCost_childLabel');
+		assert.equal(parts.composition.rows[2].title, 'billing-auditor', 'the full label stays available as a title');
+		assert.equal(parts.composition.rows.at(-1).labelClass, 'dshSessionCost_totalRow', 'the total row is marked');
 		assert.equal(parts.sections[0].head, '高峰时段（×2）');
 		assert.equal(pairValue(parts.sections[0].rows, '输入 · 缓存未命中'), '500,000 tok ¥1.00');
 		assert.equal(pairValue(parts.sections[0].rows, '输入 · 缓存命中'), '4,250,000 tok ¥0.17');
@@ -1927,7 +2000,12 @@ await checkAsync('client: subagent entries are priced with their own model row (
 		);
 		chipOf(tree).props.onClick();
 		const parts = partsOf(panelOf(render({ split: ZERO_SPLIT, sessionId: 'root-1' })));
-		assert.deepEqual(parts.top[2], ['子代理会话（1 个）', '¥9.00']);
+		assert.deepEqual(parts.composition.rows.map(({ label, value }) => [label, value]), [
+			['主会话', '¥0.00'],
+			['子代理会话（1 个）', '¥9.00'],
+			['· child-pro', '¥9.00'],
+			['合计', '¥9.00'],
+		], 'the pro-priced child is decomposed in the composition section');
 	} finally {
 		delete sandbox.fetch;
 	}
@@ -2024,7 +2102,14 @@ await checkAsync('client: a superseded tree response does not overwrite a newer 
 		const tree = render({ split: ZERO_SPLIT, sessionId: 'root-1' });
 		assert.equal(labelOf(tree), '花费 ¥4.06 · 余额 ¥12.34', 'the stale tree response is dropped');
 		const parts = partsOf(panelOf(render({ split: ZERO_SPLIT, sessionId: 'root-1' })));
-		assert.deepEqual(parts.top[2], ['子代理会话（3 个）', '¥2.06'], 'the newer tree keeps its subagent row');
+		assert.deepEqual(parts.composition.rows.map(({ label, value }) => [label, value]), [
+			['主会话', '¥2.00'],
+			['子代理会话（3 个）', '¥2.06'],
+			['· billing-auditor', '¥0.5000'],
+			['· test-author', '¥1.00'],
+			['· verifier', '¥0.5600'],
+			['合计', '¥4.06'],
+		], 'the newer tree keeps its composition rows');
 	} finally {
 		delete sandbox.fetch;
 	}
@@ -2046,6 +2131,139 @@ await checkAsync('client: unmount aborts the in-flight tree fetch (v1.2)', async
 		pending[0](treeResponse(TREE_VALUE));
 		await settleAsync(); // resolving after unmount must be a no-op, not a crash
 		assert.equal(slots.length, 0, 'no component state was mounted again');
+	} finally {
+		delete sandbox.fetch;
+	}
+});
+
+/* ---- cost composition (v1.2.1) ---- */
+
+await checkAsync('client: the composition rows add up to the tree total (v1.2.1)', async () => {
+	account.balance = remoteReady([wallet('CNY', '12.34')]);
+	stubTreeFetch(() => treeResponse(TREE_VALUE));
+	try {
+		await mountLive({ split: ZERO_SPLIT, sessionId: 'root-1' });
+		const tree = render({ split: ZERO_SPLIT, sessionId: 'root-1' });
+		chipOf(tree).props.onClick();
+		const parts = partsOf(panelOf(render({ split: ZERO_SPLIT, sessionId: 'root-1' })));
+		const amount = (row) => Number.parseFloat(row.value.replace(/[^0-9.]/gu, ''));
+		const [main, children] = parts.composition.rows;
+		const total = parts.composition.rows.at(-1);
+		assert.equal(main.label, '主会话');
+		assert.equal(children.label, '子代理会话（3 个）');
+		assert.equal(total.label, '合计');
+		assert.equal(total.valueClass, 'dshSessionCost_totalRow', 'the total row is marked on both cells');
+		assert.ok(
+			Math.abs(amount(main) + amount(children) - amount(total)) < 0.005,
+			'主会话 + 子代理会话 = 合计',
+		);
+	} finally {
+		delete sandbox.fetch;
+	}
+});
+
+await checkAsync('client: the composition section only appears when there are subagents (v1.2.1)', async () => {
+	account.balance = remoteReady([wallet('CNY', '12.34')]);
+	const calls = stubTreeFetch(() => treeResponse(ROOT_ONLY_TREE_VALUE));
+	try {
+		await mountLive({ split: ZERO_SPLIT, sessionId: 'root-1' });
+		assert.equal(calls.length, 1);
+		let tree = render({ split: ZERO_SPLIT, sessionId: 'root-1' });
+		assert.equal(labelOf(tree), '花费 ¥1.57 · 余额 ¥12.34', 'a root-only tree shows the root spend');
+		chipOf(tree).props.onClick();
+		let parts = partsOf(panelOf(render({ split: ZERO_SPLIT, sessionId: 'root-1' })));
+		assert.equal(parts.composition, null, 'no composition section without children');
+		delete sandbox.fetch;
+		await mountLive({ split: SPLIT, sessionId: 'root-1' }); // no fetch at all: v1.1 fallback
+		tree = render({ split: SPLIT, sessionId: 'root-1' });
+		assert.equal(labelOf(tree), '花费 ¥3.00 · 余额 ¥12.34', 'a tree-less render keeps the v1.1 total');
+		chipOf(tree).props.onClick();
+		parts = partsOf(panelOf(render({ split: SPLIT, sessionId: 'root-1' })));
+		assert.equal(parts.composition, null, 'the v1.1 fallback has no composition section');
+	} finally {
+		delete sandbox.fetch;
+	}
+});
+
+await checkAsync('client: long child labels elide and keep the full label as a title (v1.2.1)', async () => {
+	account.balance = remoteReady([wallet('CNY', '12.34')]);
+	stubTreeFetch(() => treeResponse(LONG_LABEL_TREE_VALUE));
+	try {
+		await mountLive({ split: ZERO_SPLIT, sessionId: 'root-1' });
+		const tree = render({ split: ZERO_SPLIT, sessionId: 'root-1' });
+		assert.equal(labelOf(tree), '花费 ¥1.00 · 余额 ¥12.34');
+		chipOf(tree).props.onClick();
+		const rows = partsOf(panelOf(render({ split: ZERO_SPLIT, sessionId: 'root-1' }))).composition.rows;
+		const longLabel = LONG_LABEL_TREE_VALUE.children[0].label;
+		assert.equal(rows.length, 5, 'main + subagents + 2 children + total');
+		assert.equal(rows[2].label, `· ${longLabel.slice(0, 18)}…`, 'the label is elided at 18 characters');
+		assert.equal(rows[2].title, longLabel, 'the full label is kept as the title attribute');
+		assert.equal(rows[2].labelClass, 'dshSessionCost_childLabel');
+		assert.equal(rows[2].value, '¥0.5000');
+		assert.ok(longLabel.length > 18, 'the fixture label is actually long');
+	} finally {
+		delete sandbox.fetch;
+	}
+});
+
+await checkAsync('client: a child without a label falls back to the short session id (v1.2.1)', async () => {
+	account.balance = remoteReady([wallet('CNY', '12.34')]);
+	stubTreeFetch(() => treeResponse(LONG_LABEL_TREE_VALUE));
+	try {
+		await mountLive({ split: ZERO_SPLIT, sessionId: 'root-1' });
+		const tree = render({ split: ZERO_SPLIT, sessionId: 'root-1' });
+		chipOf(tree).props.onClick();
+		const rows = partsOf(panelOf(render({ split: ZERO_SPLIT, sessionId: 'root-1' }))).composition.rows;
+		assert.equal(rows[3].label, '· 子代理会话 abcdef12', 'the fallback is the subagent label plus the short id');
+		assert.equal(rows[3].title, '子代理会话 abcdef12');
+		assert.equal(rows[3].labelClass, 'dshSessionCost_childLabel');
+		assert.equal(rows[3].value, '¥0.5000');
+	} finally {
+		delete sandbox.fetch;
+	}
+});
+
+await checkAsync('client: english locale localises the composition section (v1.2.1)', async () => {
+	account.balance = remoteReady([wallet('CNY', '12.34')]);
+	stubTreeFetch(() => treeResponse(EN_TREE_VALUE));
+	try {
+		await mountLive({ split: ZERO_SPLIT, sessionId: 'root-1', locale: 'en' });
+		const tree = render({ split: ZERO_SPLIT, sessionId: 'root-1', locale: 'en' });
+		assert.equal(labelOf(tree), 'Spent ¥3.00 · Balance ¥12.34');
+		chipOf(tree).props.onClick();
+		const parts = partsOf(panelOf(render({ split: ZERO_SPLIT, sessionId: 'root-1', locale: 'en' })));
+		assert.equal(parts.composition.head, 'Cost breakdown');
+		assert.deepEqual(parts.composition.rows.map(({ label, value }) => [label, value]), [
+			['Main session', '¥0.00'],
+			['Subagent sessions (2)', '¥3.00'],
+			['· billing-auditor', '¥1.00'],
+			['· verifier', '¥2.00'],
+			['Total', '¥3.00'],
+		]);
+	} finally {
+		delete sandbox.fetch;
+	}
+});
+
+await checkAsync('client: the composition section keeps its place in the panel (v1.2.1)', async () => {
+	account.balance = remoteReady([wallet('CNY', '12.34')]);
+	stubTreeFetch(() => treeResponse(TREE_VALUE));
+	try {
+		await mountLive({ split: ZERO_SPLIT, sessionId: 'root-1' });
+		account.balance = remoteReady([wallet('CNY', '9.24')]);
+		const tree = await tickRefresh({ split: ZERO_SPLIT, sessionId: 'root-1' });
+		assert.equal(labelOf(tree), '花费 ¥3.63 · 余额 ¥9.24');
+		chipOf(tree).props.onClick();
+		const parts = partsOf(panelOf(render({ split: ZERO_SPLIT, sessionId: 'root-1' })));
+		assert.deepEqual(parts.order, [
+			'top',
+			'composition',
+			'section:高峰时段（×2）',
+			'section:空闲时段（×1）',
+			'account',
+			'note',
+			'balance',
+		], 'top grid -> composition -> period sections -> account -> balance');
 	} finally {
 		delete sandbox.fetch;
 	}

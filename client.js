@@ -50,7 +50,7 @@ window.__ModuleLoader__.load({
 		/** Locale namespace whose dictionaries carry every visible string. */
 		const NS = 'session-cost';
 		/** Identity the account Remote carries for this UI. */
-		const CLIENT_VERSION = '1.2.0';
+		const CLIENT_VERSION = '1.2.1';
 		/** Currency assumed when the account reports no wallet. */
 		const DEFAULT_CURRENCY = 'CNY';
 		/** Balance re-read cadence, and the shortest gap between two reads. */
@@ -58,6 +58,8 @@ window.__ModuleLoader__.load({
 		const BALANCE_MIN_GAP_MS = 10000;
 		/** Session-tree spend refresh cadence (the route observes sibling sessions). */
 		const TREE_REFRESH_MS = 20000;
+		/** Longest subagent label rendered in the cost breakdown before eliding. */
+		const CHILD_LABEL_MAX = 18;
 		/**
 		 * Smallest account-wide excess over this session's own spend worth
 		 * surfacing separately. Below it the difference is noise (rounding,
@@ -144,7 +146,11 @@ window.__ModuleLoader__.load({
 			rowAccount: '账户已扣（自打开本页）',
 			rowAccountExtra: '其中其他会话 / 子代理 / 工具',
 			rowSubagents: '子代理会话（{count} 个）',
-			accountNote: '余额为整个账户共用：其他会话、子代理、其他工具或设备同样会扣费。账户已扣只统计本页打开后观察到的余额减少（平台按批次结算，可能短暂滞后），充值或赠金变动不计入。',
+			sectionComposition: '费用构成',
+			rowMainSession: '主会话',
+			rowTotal: '合计',
+			childFallback: '子代理会话',
+			accountNote: '余额为整个账户共用：其他会话、子代理、其他工具或设备同样会扣费。账户已扣只统计本页打开后观察到的余额减少（平台按批次结算，可能短暂滞后），充值或赠金变动不计入。它通常小于上面的「本次会话花费」（后者包含本页打开前的花费），两者时间窗不同。',
 			rowTopUp: '充值余额',
 			rowBonus: '赠金余额',
 			rowAvailable: '可用合计',
@@ -182,7 +188,11 @@ window.__ModuleLoader__.load({
 			rowAccount: 'Charged to account (since this page opened)',
 			rowAccountExtra: 'of which other sessions / subagents / tools',
 			rowSubagents: 'Subagent sessions ({count})',
-			accountNote: 'The balance is shared by the whole account: other sessions, subagents, other tools, or other devices also draw it down. Account charged only counts balance decreases observed while this page is open (the platform settles in batches, so it can lag briefly); top-ups and grants are not counted.',
+			sectionComposition: 'Cost breakdown',
+			rowMainSession: 'Main session',
+			rowTotal: 'Total',
+			childFallback: 'Subagent session',
+			accountNote: 'The balance is shared by the whole account: other sessions, subagents, other tools, or other devices also draw it down. Account charged only counts balance decreases observed while this page is open (the platform settles in batches, so it can lag briefly); top-ups and grants are not counted. It is usually smaller than this session cost above (which includes spend from before the page opened) because the two windows differ.',
 			rowTopUp: 'Topped up',
 			rowBonus: 'Granted',
 			rowAvailable: 'Available',
@@ -233,6 +243,9 @@ window.__ModuleLoader__.load({
 			'.dshSessionCost_details dd em{font-style:normal;color:var(--dsw-alias-label-tertiary);margin-right:6px}',
 			'.dshSessionCost_details .dshSessionCost_available{color:var(--dsw-alias-label-primary);font-weight:500}',
 			'.dshSessionCost_subtotalRow{color:var(--dsw-alias-label-secondary)}',
+			'.dshSessionCost_totalRow{color:var(--dsw-alias-label-primary);font-weight:500}',
+			'.dshSessionCost_childLabel{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;',
+			'color:var(--dsw-alias-label-tertiary)}',
 			'.dshSessionCost_note{color:var(--dsw-alias-label-tertiary)}',
 			'.dshSessionCost_footer{display:flex;justify-content:space-between;gap:12px;',
 			'margin-top:2px;padding-top:10px;border-top:.5px solid var(--dsw-alias-border-l2);',
@@ -850,6 +863,7 @@ window.__ModuleLoader__.load({
 				let treeSpend = null;
 				let childSpend = 0;
 				let childCount = 0;
+				const childRows = [];
 				if (treeEntries !== null && treeEntries.length > 0) {
 					let total = 0;
 					const peaks = [];
@@ -864,8 +878,15 @@ window.__ModuleLoader__.load({
 					for (const entry of tree.children) {
 						if (entry === null || typeof entry !== 'object'
 							|| entry.split === null || typeof entry.split !== 'object') continue;
-						childSpend += splitCost(entry.split, currency, entry.model ?? model);
+						const entryCost = splitCost(entry.split, currency, entry.model ?? model);
+						childSpend += entryCost;
 						childCount += 1;
+						childRows.push({
+							key: `${childCount}-${String(entry.id ?? '')}`,
+							id: typeof entry.id === 'string' ? entry.id : '',
+							label: typeof entry.label === 'string' ? entry.label : '',
+							cost: entryCost,
+						});
 					}
 				}
 				const resolved = resolveSpend({ split: displaySplit, totals, currency, model, now });
@@ -953,14 +974,40 @@ window.__ModuleLoader__.load({
 					gridRow('model', tr('rowModel'), model ?? tr('rowModelDefault')),
 					gridRow('basis', tr('rowBasis'), tr(resolved.basis.key, resolved.basis.params)),
 				];
-				/* The tree total includes subagent Sessions; name their share so the
-				   difference from this session's own events is never a mystery. */
+
+				/** Shorten one subagent label to keep the breakdown grid readable. */
+				const shortLabel = (text) => {
+					const value = typeof text === 'string' ? text.trim() : '';
+					return value.length > CHILD_LABEL_MAX ? `${value.slice(0, CHILD_LABEL_MAX)}…` : value;
+				};
+				/**
+				 * Cost composition: main session + every subagent session + total, so the
+				 * tree total above can be read as an explicit sum instead of arithmetic.
+				 */
+				let compositionSection = null;
 				if (childCount > 0) {
-					topRows.push(gridRow(
-						'subagents',
-						tr('rowSubagents', { count: childCount }),
-						money(childSpend, currency),
-					));
+					const compositionRows = [
+						gridRow('composition-main', tr('rowMainSession'), money(Math.max(0, sessionTotal - childSpend), currency)),
+						gridRow('composition-children', tr('rowSubagents', { count: childCount }), money(childSpend, currency)),
+					];
+					for (const child of childRows) {
+						const full = typeof child.label === 'string' && child.label.trim() !== ''
+							? child.label.trim()
+							: `${tr('childFallback')} ${child.id.slice(0, 8)}`;
+						compositionRows.push([
+							h('dt', {
+								key: `composition-child-${child.key}-t`,
+								className: 'dshSessionCost_childLabel',
+								title: full,
+							}, `· ${shortLabel(full)}`),
+							h('dd', { key: `composition-child-${child.key}-v` }, money(child.cost, currency)),
+						]);
+					}
+					compositionRows.push(classedRow('composition-total', tr('rowTotal'), money(sessionTotal, currency), 'dshSessionCost_totalRow'));
+					compositionSection = [
+						h('div', { key: 'composition-head', className: 'dshSessionCost_sectionHead' }, tr('sectionComposition')),
+						h('dl', { key: 'composition-list', className: 'dshSessionCost_details dshSessionCost_compositionRows' }, compositionRows.flat()),
+					];
 				}
 
 				/* Account-wide deductions reconcile the chip with the account balance:
@@ -1025,6 +1072,7 @@ window.__ModuleLoader__.load({
 					),
 					h('div', { className: 'dshSessionCost_rule', 'aria-hidden': true }),
 					h('dl', { key: 'top', className: 'dshSessionCost_details' }, topRows.flat()),
+					compositionSection,
 					resolved.sections.map((section) => h(
 						React.Fragment,
 						{ key: `section-${section.key}` },

@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-session-cost",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "private": true,
   "type": "module",
   "description": "Shows this session tree's spend (this session plus its subagent sessions), the account charges observed since the page opened, and the account's remaining balance below the composer.",
